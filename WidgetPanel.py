@@ -329,7 +329,7 @@ class FloatLabel(QWidget):
             except Exception:
                 pass
 
-    # ----- 数据来源：新浪财经 -----
+# ----- 数据来源：新浪财经 -----
     def _get_price(self, codes:list):
         label = ",".join([str(c).strip() for c in codes if str(c).strip()])
         if not label:
@@ -341,6 +341,17 @@ class FloatLabel(QWidget):
         headers = {'Referer': 'https://finance.sina.com.cn', 'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url, headers=headers, timeout=3)
         r.encoding = 'gbk'
+
+        # === 新增：资金金额自适应格式化函数 ===
+        def format_amt(amt):
+            if amt >= 10000000:       # 大于等于 1000万 (即 0.1亿)
+                # 保留最多2位小数，并去除末尾多余的 0 和小数点
+                return f"{amt / 100000000:.2f}".rstrip('0').rstrip('.') + "亿"
+            elif amt >= 1000:         # 大于等于 1000 (即 0.1万)
+                return f"{amt / 10000:.2f}".rstrip('0').rstrip('.') + "万"
+            else:                     # 小于 1000
+                return str(int(amt))
+
         for line in r.text.split('\n'):
             if not line or '"' not in line:
                 continue
@@ -369,13 +380,11 @@ class FloatLabel(QWidget):
 
             etf = code[2] in ('1','5')
 
-            # 构建买一/卖一数据及其颜色信息，并添加位置箭头
             b1_label = ""
             s1_label = ""
-            b1_color_sign = 0  # 买一颜色：1红 0中性 -1绿
-            s1_color_sign = 0  # 卖一颜色：1红 0中性 -1绿
+            b1_color_sign = 0  
+            s1_color_sign = 0  
 
-            # 决定小数精度用于比较是否相等（避免浮点微小误差）
             dec = 3 if etf else 2
             def almost_eq(a, b):
                 try:
@@ -383,7 +392,6 @@ class FloatLabel(QWidget):
                 except Exception:
                     return False
 
-            # 标记：买一箭头位于右侧 '<'，卖一箭头位于左侧 '>'
             buy_marker = " "
             sell_marker = " "
             if first_pur > 0 and almost_eq(current_price, first_pur):
@@ -392,15 +400,18 @@ class FloatLabel(QWidget):
                 sell_marker = ">"
 
             if first_pur == first_sell > 0:
-                # 集合竞价：配对量 / 未配对量
-                # 此处不显示成交方向箭头（竞价阶段无 <> 指示），且配对量和未配对量使用统一颜色规则
-                current_price = first_sell  # 9:15 ~ 9:25; 14:57 ~ 15:00 竞价
-                paired = seller[0]
-                # unpaired_sign: >0 表示买方优势，<0 表示卖方优势
-                unpaired_sign = -seller[1] if seller[1] > 0 else purchaser[1]
-                # 显示数量（手）或价格或数量和价格（手数(价格)）
-                paired_cnt = int(paired/100)
-                unpaired_cnt = int(unpaired_sign/100)
+                # ====== 集合竞价：按现价计算资金规模 ======
+                current_price = first_sell  
+                paired_shares = seller[0]
+                unpaired_shares = -seller[1] if seller[1] > 0 else purchaser[1]
+                
+                # 计算金额 = 股数 * 现价
+                paired_amt = paired_shares * current_price
+                unpaired_amt = abs(unpaired_shares) * current_price
+                
+                paired_str = format_amt(paired_amt)
+                unpaired_str = ("+" if unpaired_shares > 0 else "-") + format_amt(unpaired_amt) if unpaired_amt > 0 else "0"
+
                 b_price = f"{first_pur:.3f}" if etf else f"{first_pur:.2f}"
                 s_price = f"{first_sell:.3f}" if etf else f"{first_sell:.2f}"
                 mode = getattr(self, 'b1s1_display', 'qty')
@@ -408,55 +419,53 @@ class FloatLabel(QWidget):
                     b1_label = f"{b_price}"
                     s1_label = f"{s_price}"
                 elif mode == 'both':
-                    b1_label = f"{paired_cnt:d}({b_price})"
-                    s1_label = f"{unpaired_cnt:+d}({s_price})"
+                    b1_label = f"{paired_str}({b_price})"
+                    s1_label = f"{unpaired_str}({s_price})"
                 else:
-                    b1_label = f"{paired_cnt:d}"
-                    s1_label = f"{unpaired_cnt:+d}"
-                # 竞价颜色：根据未配对量的方向
-                if unpaired_sign > 0:
-                    b1_color_sign = 1
-                    s1_color_sign = 1
-                elif unpaired_sign < 0:
-                    b1_color_sign = -1
-                    s1_color_sign = -1
+                    b1_label = f"{paired_str}"
+                    s1_label = f"{unpaired_str}"
+                    
+                if unpaired_shares > 0:
+                    b1_color_sign = 1; s1_color_sign = 1
+                elif unpaired_shares < 0:
+                    b1_color_sign = -1; s1_color_sign = -1
                 else:
-                    b1_color_sign = 0
-                    s1_color_sign = 0
+                    b1_color_sign = 0; s1_color_sign = 0
             else:
-                # 连续竞价：买一数量/卖一数量
+                # ====== 连续竞价：买/卖挂单资金 ======
                 if first_pur > 0:
-                    cnt = f"{int(purchaser[0]/100)}"
+                    b_amt = purchaser[0] * first_pur
+                    cnt_str = format_amt(b_amt)
                     b_price = f"{first_pur:.3f}" if etf else f"{first_pur:.2f}"
                     mode = getattr(self, 'b1s1_display', 'qty')
                     if mode == 'price':
                         b1_label = f"{b_price}{buy_marker}"
                     elif mode == 'both':
-                        b1_label = f"{cnt}({b_price}){buy_marker}"
+                        b1_label = f"{cnt_str}({b_price}){buy_marker}"
                     else:
-                        b1_label = f"{cnt}{buy_marker}"
+                        b1_label = f"{cnt_str}{buy_marker}"
                 else:
                     b1_label = f"-{buy_marker}"
 
                 if first_sell > 0:
-                    cnt = f"{int(seller[0]/100)}"
+                    s_amt = seller[0] * first_sell
+                    cnt_str = format_amt(s_amt)
                     s_price = f"{first_sell:.3f}" if etf else f"{first_sell:.2f}"
                     mode = getattr(self, 'b1s1_display', 'qty')
                     if mode == 'price':
                         s1_label = f"{sell_marker}{s_price}"
                     elif mode == 'both':
-                        s1_label = f"{sell_marker}{cnt}({s_price})"
+                        s1_label = f"{sell_marker}{cnt_str}({s_price})"
                     else:
-                        s1_label = f"{sell_marker}{cnt}"
+                        s1_label = f"{sell_marker}{cnt_str}"
                 else:
                     s1_label = f"{sell_marker}-"
 
-                # 连续竞价时：买一固定红色，卖一固定绿色
                 b1_color_sign = 1
                 s1_color_sign = -1
             
             if current_price == 0:
-                current_price = prev_close # 9:00 ~ 9:15 无数据
+                current_price = prev_close
             if opening_price == 0: 
                 opening_price = current_price
                 high_price = current_price
@@ -464,11 +473,10 @@ class FloatLabel(QWidget):
 
             change = current_price - prev_close if prev_close else 0.0
             change_pct = (current_price / prev_close - 1) * 100 if prev_close else 0.0
-            avg = (deals_amt / deals_vol) if deals_vol > 0 else prev_close # 均价
+            avg = (deals_amt / deals_vol) if deals_vol > 0 else prev_close 
             p_sum, s_sum = sum(purchaser), sum(seller)
-            committee = (100 * (p_sum - s_sum) / (p_sum + s_sum)) if (p_sum + s_sum) > 0 else 0.0 # 委比
+            committee = (100 * (p_sum - s_sum) / (p_sum + s_sum)) if (p_sum + s_sum) > 0 else 0.0 
 
-            # 触及日高/低显示箭头
             arrow = " "
             if high_price > low_price:
                 if current_price == high_price: arrow = "↑"
@@ -476,7 +484,6 @@ class FloatLabel(QWidget):
 
             k_payload = {"k": (opening_price, current_price, high_price, low_price, prev_close)}
 
-            # "代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价",  "K线"
             if code[2] not in ('1','5'):
                 price_data.append([
                     code[2:] if self.short_code else code,
