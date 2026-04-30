@@ -26,7 +26,7 @@ class SettingsDialog(QDialog):
 
         self.tab_sizes = {
             0: QSize(300, 300),
-            1: QSize(440, 420),
+            1: QSize(460, 440),
             2: QSize(360, 350),
             3: QSize(300, 220),
         }
@@ -156,7 +156,7 @@ class SettingsDialog(QDialog):
         
         # 买一/卖一显示模式：数量 / 价格 / 数量和价格
         self.cmb_b1s1_display = QComboBox()
-        self.cmb_b1s1_display.setFixedWidth(100)
+        self.cmb_b1s1_display.setFixedWidth(90)
         self.cmb_b1s1_display.addItem("数量", userData="qty")
         self.cmb_b1s1_display.addItem("价格", userData="price")
         self.cmb_b1s1_display.addItem("数量和价格", userData="both")
