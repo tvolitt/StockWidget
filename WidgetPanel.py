@@ -342,12 +342,11 @@ class FloatLabel(QWidget):
         r = requests.get(url, headers=headers, timeout=3)
         r.encoding = 'gbk'
 
-        # === 新增：资金金额自适应格式化函数 ===
+        # 金额自适应格式化函数（0.1亿/0.1万/整型）
         def format_amt(amt):
-            if amt >= 10000000:       # 大于等于 1000万 (即 0.1亿)
-                # 保留最多2位小数，并去除末尾多余的 0 和小数点
+            if amt >= 10000000:       # 大于等于 1000万 (0.1亿)
                 return f"{amt / 100000000:.2f}".rstrip('0').rstrip('.') + "亿"
-            elif amt >= 1000:         # 大于等于 1000 (即 0.1万)
+            elif amt >= 1000:         # 大于等于 1000 (0.1万)
                 return f"{amt / 10000:.2f}".rstrip('0').rstrip('.') + "万"
             else:                     # 小于 1000
                 return str(int(amt))
@@ -362,168 +361,115 @@ class FloatLabel(QWidget):
 
             code          = heads[2]
             name          = parts[0]
-            opening_price = float(parts[1] or 0)   # 开盘
             prev_close    = float(parts[2] or 0)   # 昨收
             current_price = float(parts[3] or 0)   # 现价
-            high_price    = float(parts[4] or 0)   # 当日最高
-            low_price     = float(parts[5] or 0)   # 当日最低
-            first_pur     = float(parts[6] or 0)   # 买一
-            first_sell    = float(parts[7] or 0)   # 卖一
-            deals_vol     = float(parts[8] or 0)   # 成交量
-            deals_amt     = float(parts[9] or 0)   # 成交额
-            purchaser     = [int(x or 0) for x in parts[10:19:2]]  # 买盘，股数
-            pur_price     = [float(x or 0) for x in parts[11:20:2]]  # 买盘，价格
-            seller        = [int(x or 0) for x in parts[20:29:2]]  # 卖盘，股数
-            sel_price     = [float(x or 0) for x in parts[21:30:2]]  # 卖盘，价格
-            update_date   = [int(x or 0) for x in parts[30].split('-')]  # 日期
-            update_time   = [int(x or 0) for x in parts[31].split(':')]  # 时间
+            opening_price = float(parts[1] or 0)
+            high_price    = float(parts[4] or 0)
+            low_price     = float(parts[5] or 0)
+            first_pur     = float(parts[6] or 0)   # 买一价
+            first_sell    = float(parts[7] or 0)   # 卖一价
+            deals_vol     = float(parts[8] or 0)
+            deals_amt     = float(parts[9] or 0)
+            purchaser     = [int(x or 0) for x in parts[10:19:2]]  # 买盘股数
+            seller        = [int(x or 0) for x in parts[20:29:2]]  # 卖盘股数
 
             etf = code[2] in ('1','5')
-
-            b1_label = ""
-            s1_label = ""
-            b1_color_sign = 0  
-            s1_color_sign = 0  
-
             dec = 3 if etf else 2
+            
             def almost_eq(a, b):
-                try:
-                    return round(float(a), dec) == round(float(b), dec)
-                except Exception:
-                    return False
+                return round(float(a), dec) == round(float(b), dec)
 
-            buy_marker = " "
-            sell_marker = " "
-            if first_pur > 0 and almost_eq(current_price, first_pur):
-                buy_marker = "<"
-            if first_sell > 0 and almost_eq(current_price, first_sell):
-                sell_marker = ">"
+            # 获取当前的显示模式: 'qty'|'price'|'both'
+            mode = getattr(self, 'b1s1_display', 'qty')
+            b1_label, s1_label = "", ""
+            b1_color_sign, s1_color_sign = 0, 0
+
+            # 箭头标记
+            buy_marker = "<" if first_pur > 0 and almost_eq(current_price, first_pur) else ""
+            sell_marker = ">" if first_sell > 0 and almost_eq(current_price, first_sell) else ""
 
             if first_pur == first_sell > 0:
-                # ====== 集合竞价：按现价计算资金规模 ======
-                current_price = first_sell  
+                # ====== 集合竞价阶段 ======
                 paired_shares = seller[0]
                 unpaired_shares = -seller[1] if seller[1] > 0 else purchaser[1]
                 
-                # 计算金额 = 股数 * 现价
-                paired_amt = paired_shares * current_price
-                unpaired_amt = abs(unpaired_shares) * current_price
-                
-                paired_str = format_amt(paired_amt)
-                unpaired_str = ("+" if unpaired_shares > 0 else "-") + format_amt(unpaired_amt) if unpaired_amt > 0 else "0"
+                p_hands = f"{int(paired_shares/100)}"
+                u_hands = f"{int(unpaired_shares/100):+d}"
+                p_amt = format_amt(paired_shares * first_sell)
+                u_amt = ("+" if unpaired_shares > 0 else "-") + format_amt(abs(unpaired_shares) * first_sell)
 
-                b_price = f"{first_pur:.3f}" if etf else f"{first_pur:.2f}"
-                s_price = f"{first_sell:.3f}" if etf else f"{first_sell:.2f}"
-                mode = getattr(self, 'b1s1_display', 'qty')
-                if mode == 'price':
-                    b1_label = f"{b_price}"
-                    s1_label = f"{s_price}"
-                elif mode == 'both':
-                    b1_label = f"{paired_str}({b_price})"
-                    s1_label = f"{unpaired_str}({s_price})"
-                else:
-                    b1_label = f"{paired_str}"
-                    s1_label = f"{unpaired_str}"
-                    
-                if unpaired_shares > 0:
-                    b1_color_sign = 1; s1_color_sign = 1
-                elif unpaired_shares < 0:
-                    b1_color_sign = -1; s1_color_sign = -1
-                else:
-                    b1_color_sign = 0; s1_color_sign = 0
+                if mode == 'qty':
+                    b1_label, s1_label = p_hands, u_hands
+                elif mode == 'price':
+                    b1_label, s1_label = p_amt, u_amt
+                else: # both
+                    b1_label, s1_label = f"{p_hands}({p_amt})", f"{u_hands}({u_amt})"
+
+                b1_color_sign = 1 if unpaired_shares > 0 else (-1 if unpaired_shares < 0 else 0)
+                s1_color_sign = b1_color_sign
             else:
-                # ====== 连续竞价：买/卖挂单资金 ======
+                # ====== 连续竞价阶段 ======
+                # 买一处理
                 if first_pur > 0:
-                    b_amt = purchaser[0] * first_pur
-                    cnt_str = format_amt(b_amt)
-                    b_price = f"{first_pur:.3f}" if etf else f"{first_pur:.2f}"
-                    mode = getattr(self, 'b1s1_display', 'qty')
-                    if mode == 'price':
-                        b1_label = f"{b_price}{buy_marker}"
-                    elif mode == 'both':
-                        b1_label = f"{cnt_str}({b_price}){buy_marker}"
-                    else:
-                        b1_label = f"{cnt_str}{buy_marker}"
+                    hands = f"{int(purchaser[0]/100)}"
+                    amt = format_amt(purchaser[0] * first_pur)
+                    if mode == 'qty': b1_label = f"{hands}{buy_marker}"
+                    elif mode == 'price': b1_label = f"{amt}{buy_marker}"
+                    else: b1_label = f"{hands}({amt}){buy_marker}"
                 else:
                     b1_label = f"-{buy_marker}"
 
+                # 卖一处理
                 if first_sell > 0:
-                    s_amt = seller[0] * first_sell
-                    cnt_str = format_amt(s_amt)
-                    s_price = f"{first_sell:.3f}" if etf else f"{first_sell:.2f}"
-                    mode = getattr(self, 'b1s1_display', 'qty')
-                    if mode == 'price':
-                        s1_label = f"{sell_marker}{s_price}"
-                    elif mode == 'both':
-                        s1_label = f"{sell_marker}{cnt_str}({s_price})"
-                    else:
-                        s1_label = f"{sell_marker}{cnt_str}"
+                    hands = f"{int(seller[0]/100)}"
+                    amt = format_amt(seller[0] * first_sell)
+                    if mode == 'qty': s1_label = f"{sell_marker}{hands}"
+                    elif mode == 'price': s1_label = f"{sell_marker}{amt}"
+                    else: s1_label = f"{sell_marker}{hands}({amt})"
                 else:
                     s1_label = f"{sell_marker}-"
 
-                b1_color_sign = 1
-                s1_color_sign = -1
-            
-            if current_price == 0:
-                current_price = prev_close
-            if opening_price == 0: 
-                opening_price = current_price
-                high_price = current_price
-                low_price = current_price
+                b1_color_sign, s1_color_sign = 1, -1
 
+            # 补全其他数据逻辑...
+            if current_price == 0: current_price = prev_close
             change = current_price - prev_close if prev_close else 0.0
             change_pct = (current_price / prev_close - 1) * 100 if prev_close else 0.0
-            avg = (deals_amt / deals_vol) if deals_vol > 0 else prev_close 
+            avg = (deals_amt / deals_vol) if deals_vol > 0 else prev_close
             p_sum, s_sum = sum(purchaser), sum(seller)
-            committee = (100 * (p_sum - s_sum) / (p_sum + s_sum)) if (p_sum + s_sum) > 0 else 0.0 
-
+            committee = (100 * (p_sum - s_sum) / (p_sum + s_sum)) if (p_sum + s_sum) > 0 else 0.0
+            
             arrow = " "
             if high_price > low_price:
                 if current_price == high_price: arrow = "↑"
                 elif current_price == low_price: arrow = "↓"
 
             k_payload = {"k": (opening_price, current_price, high_price, low_price, prev_close)}
-
-            if code[2] not in ('1','5'):
-                price_data.append([
-                    code[2:] if self.short_code else code,
-                    name if self.name_length == 0 else name[:self.name_length],
-                    f"{current_price:.2f}{arrow}",
-                    f"{change:+.2f}",
-                    f"{change_pct:+.2f}%",
-                    b1_label,
-                    s1_label,
-                    f"{committee:+.2f}%",
-                    f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
-                    f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
-                    f"{avg:.2f}",
-                    k_payload
-                ])
-            else:
-                price_data.append([
-                    code[2:] if self.short_code else code,
-                    name if self.name_length == 0 else name[:self.name_length],
-                    f"{current_price:.3f}{arrow}",
-                    f"{change:+.3f}",
-                    f"{change_pct:+.2f}%",
-                    b1_label,
-                    s1_label,
-                    f"{committee:+.2f}%",
-                    f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
-                    f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
-                    f"{avg:.3f}",
-                    k_payload
-                ])
+            
+            # 格式化列表数据
+            row = [
+                code[2:] if self.short_code else code,
+                name if self.name_length == 0 else name[:self.name_length],
+                f"{current_price:.{dec}f}{arrow}",
+                f"{change:+.{dec}f}",
+                f"{change_pct:+.2f}%",
+                b1_label,
+                s1_label,
+                f"{committee:+.2f}%",
+                f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
+                f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
+                f"{avg:.{dec}f}",
+                k_payload
+            ]
+            price_data.append(row)
             sign_data.append({
-                "delta": (change > 0) - (change < 0), 
+                "delta": (change > 0) - (change < 0),
                 "commi": (committee > 0) - (committee < 0),
                 "avg": (avg > prev_close) - (avg < prev_close),
-                "b1": b1_color_sign,
-                "s1": s1_color_sign,
+                "b1": b1_color_sign, "s1": s1_color_sign,
             })
-        
-        return price_data, sign_data
 
+        return price_data, sign_data
     def _project_columns(self, full_rows, sign_data):
         # 从 ALL_HEADERS 中按显示顺序筛选已启用的列
         cols = [i for i, h in enumerate(self.ALL_HEADERS) if self.header_is_visible(h)]

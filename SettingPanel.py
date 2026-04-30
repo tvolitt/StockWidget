@@ -154,12 +154,12 @@ class SettingsDialog(QDialog):
         self.cbs.append(cb_commi)
         gl_flag_order.addWidget(cb_commi, 1, 0)
         
-        # 买一/卖一显示模式：数量 / 价格 / 数量和价格
+        # 买一/卖一显示模式：手数 / 金额 / 手数和金额
         self.cmb_b1s1_display = QComboBox()
-        self.cmb_b1s1_display.setFixedWidth(90)
-        self.cmb_b1s1_display.addItem("数量", userData="qty")
-        self.cmb_b1s1_display.addItem("价格", userData="price")
-        self.cmb_b1s1_display.addItem("数量和价格", userData="both")
+        self.cmb_b1s1_display.setFixedWidth(100)
+        self.cmb_b1s1_display.addItem("手数", userData="qty")
+        self.cmb_b1s1_display.addItem("金额", userData="price")
+        self.cmb_b1s1_display.addItem("手数和金额", userData="both")
         cur_mode = getattr(self.win, 'b1s1_display', 'qty')
         idx_mode = self.cmb_b1s1_display.findData(cur_mode)
         self.cmb_b1s1_display.setCurrentIndex(idx_mode if idx_mode>=0 else 0)
