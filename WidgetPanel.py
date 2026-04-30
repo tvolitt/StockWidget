@@ -831,8 +831,60 @@ class FloatLabel(QWidget):
         event.ignore()
         self.hide()
 
+    # ------------------
+    # --- Win11 去阴影 ---
+    # ------------------
+    def _remove_win11_border(self):
+        """
+        调用 Windows 底层 API，强制抹除 Win11 的 DWM 边框和强制阴影
+        """
+        import sys
+        if sys.platform == "win32":
+            import ctypes
+            try:
+                hwnd = int(self.winId())
+                
+                # 1. 禁用 Win11 强制圆角 (圆角会自带阴影)
+                DWMWA_WINDOW_CORNER_PREFERENCE = 33
+                DWMWCP_DONOTROUND = 1  # 不使用圆角
+                corner_policy = ctypes.c_int(DWMWCP_DONOTROUND)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 
+                    DWMWA_WINDOW_CORNER_PREFERENCE, 
+                    ctypes.byref(corner_policy), 
+                    ctypes.sizeof(corner_policy)
+                )
+
+                # 2. 禁用非客户区渲染 (彻底切断系统级阴影)
+                DWMWA_NCRENDERING_POLICY = 2
+                DWMNCRP_DISABLED = 2
+                nc_policy = ctypes.c_int(DWMNCRP_DISABLED)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 
+                    DWMWA_NCRENDERING_POLICY, 
+                    ctypes.byref(nc_policy), 
+                    ctypes.sizeof(nc_policy)
+                )
+                
+                # 3. 抹除边框颜色 (以防万一)
+                DWMWA_BORDER_COLOR = 34
+                DWMWA_COLOR_NONE = 0xFFFFFFFE
+                color = ctypes.c_int(DWMWA_COLOR_NONE)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 
+                    DWMWA_BORDER_COLOR, 
+                    ctypes.byref(color), 
+                    ctypes.sizeof(color)
+                )
+            except Exception as e:
+                print(f"去除 Win11 阴影失败: {e}")
+
     def showEvent(self, event):
         super().showEvent(event)
+
+        # 👇 新增这一行，每次窗口显示时强杀边框 👇
+        self._remove_win11_border()
+
         if self.timer and not self.timer.isActive(): 
             self.timer.start()
         if self._keep_top_timer and not self._keep_top_timer.isActive():
