@@ -6,9 +6,21 @@ from PySide6.QtGui import QColor, QFontDatabase, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget, QPushButton, QSlider,
     QGroupBox, QLabel, QColorDialog, QComboBox, QAbstractItemView,
-    QCheckBox, QListWidget, QListWidgetItem, QKeySequenceEdit, QFileDialog
+    QCheckBox, QListWidget, QListWidgetItem, QKeySequenceEdit, QFileDialog, QStyledItemDelegate
 )
 from WidgetPanel import FloatLabel
+
+class StockCodeDelegate(QStyledItemDelegate):
+    """
+    自定义编辑代理：确保双击编辑时只显示纯代码
+    """
+    def setEditorData(self, editor, index):
+        # 【核心逻辑】：从 UserRole 中读取我们存好的纯代码，而不是直接取显示的文字
+        pure_code = index.data(Qt.UserRole)
+        if pure_code:
+            editor.setText(str(pure_code))
+        else:
+            super().setEditorData(editor, index)
 
 class SettingsDialog(QDialog):
     def __init__(self, win: FloatLabel, parent: QWidget, app=None):
@@ -25,7 +37,7 @@ class SettingsDialog(QDialog):
         main.addWidget(self.tabs)
 
         self.tab_sizes = {
-            0: QSize(300, 300),
+            0: QSize(320, 320),
             1: QSize(460, 500),
             2: QSize(360, 350),
             3: QSize(300, 220),
@@ -43,13 +55,24 @@ class SettingsDialog(QDialog):
         lay_codes.setSpacing(6)
         # 1.1 代码列表
         self.list_codes = QListWidget()
+        # ↓↓↓ 新增：挂载刚才定义的“纯代码”编辑代理 ↓↓↓
+        self.list_codes.setItemDelegate(StockCodeDelegate(self.list_codes))
+        # ↑↑↑ --------------------------------- ↑↑↑
+        
         self.list_codes.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
-        self.list_codes.setFixedWidth(150)
+        self.list_codes.setFixedWidth(180)
+        
+        # 💡修改2：提前查好所有的名字
+        names_map = self._get_names_for_codes(self.win.codes)
+        
         for c in self.win.codes:
-            it = QListWidgetItem(c)
+            name = names_map.get(c, "")
+            display_text = f"{c} {name}" if name else c
+            
+            it = QListWidgetItem(display_text) # 💡修改3：显示文字变成“代码+名字”
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             it.setCheckState(Qt.Checked if c in getattr(self.win, 'checked_codes', []) else Qt.Unchecked)
-            it.setData(Qt.UserRole, c)  # 记住上次有效值
+            it.setData(Qt.UserRole, c)  # ⚠️保持不变：底层灵魂依然只存纯代码！
             self.list_codes.addItem(it)
         # 1.2 操作按钮
         btn_col = QVBoxLayout()
@@ -406,6 +429,32 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
+    def _get_names_for_codes(self, codes):
+        """批量获取名称（带本地缓存，绝对不卡顿UI）"""
+        if not hasattr(self, '_name_cache'):
+            self._name_cache = {}
+        
+        import requests
+        to_fetch = [c for c in codes if c not in self._name_cache]
+        if to_fetch:
+            try:
+                url = "http://hq.sinajs.cn/list=" + ",".join(to_fetch)
+                res = requests.get(url, headers={'Referer': 'https://finance.sina.com.cn'}, timeout=2)
+                for line in res.text.strip().split('\n'):
+                    if '="' in line:
+                        c = line.split('str_')[1].split('=')[0]
+                        n = line.split('="')[1].split(',')[0]
+                        self._name_cache[c] = n
+            except Exception:
+                pass
+            
+            # 没查到的也赋个空值，防止下次死循环查询卡顿
+            for c in to_fetch:
+                if c not in self._name_cache:
+                    self._name_cache[c] = ""
+                    
+        return {c: self._name_cache.get(c, "") for c in codes}
+
     # —— 代码规格化 —— #
     _re_full = re.compile(r'^(sh|sz|bj)\d+$')
     _re_6 = re.compile(r'^\d{6}$')
@@ -428,26 +477,46 @@ class SettingsDialog(QDialog):
         codes = []
         seen = set()
         for i in range(self.list_codes.count()):
-            txt = self.list_codes.item(i).text()
-            norm = self._normalize_code_or_none(txt)
+            txt = self.list_codes.item(i).text().strip()
+            
+            # 💡 核心魔法：不论里面有没有名字，强制切下第一段的纯代码来做校验！
+            raw_code = txt.split()[0] if txt else ""
+            norm = self._normalize_code_or_none(raw_code)
+            
             if norm:
                 if norm not in seen:
                     seen.add(norm)
                     codes.append(norm)
-                # 写回规范化文本
+                
+                # 判断当前输入框里有没有名字段
+                parts = txt.split(maxsplit=1)
+                name = parts[1] if len(parts) > 1 else ""
+                
+                # 如果没有名字，或者代码是被自动补全的（如 000001 变 sz000001），立马查名字
+                if not name or raw_code != norm:
+                    name_map = self._get_names_for_codes([norm])
+                    name = name_map.get(norm, "")
+                
+                display_text = f"{norm} {name}" if name else norm
+                
+                # 写回规范化文本 (现在包含了漂亮的名字)
                 it = self.list_codes.item(i)
-                if it.text() != norm:
+                if it.text() != display_text:
                     self.list_codes.blockSignals(True)
-                    it.setText(norm)
+                    it.setText(display_text)
                     it.setData(Qt.UserRole, norm)
                     self.list_codes.blockSignals(False)
             else:
-                # 回退到上次有效值
+                # 校验失败，回退到上次的有效值 (带上名字回退)
                 it = self.list_codes.item(i)
                 prev = it.data(Qt.UserRole)
                 if prev:
+                    name_map = self._get_names_for_codes([prev])
+                    name = name_map.get(prev, "")
+                    display_text = f"{prev} {name}" if name else prev
+                    
                     self.list_codes.blockSignals(True)
-                    it.setText(prev)
+                    it.setText(display_text)
                     self.list_codes.blockSignals(False)
                 else:
                     # 没有上次有效值则删除
