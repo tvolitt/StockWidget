@@ -56,6 +56,12 @@ class FloatLabel(QWidget):
         self.ALL_HEADERS = ["代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价", "分时", "K线"] # <--- 新增"分时"
         self.trend_history = {} # 本地分时打点缓存库
 
+        # ==========================================
+        # ↓↓↓ 新增：动态增补线程的管理库 ↓↓↓
+        # ==========================================
+        self._backfilled_codes = {}   # 记录“已经成功派发回溯任务”的股票代码
+        self._active_threads = []        # 保存运行中的线程，防止被系统强制回收导致崩溃
+
         # 顺便把旧配置兼容代码里的 self.trend_visible 加上
         self.trend_visible = bool(cfg.get("trend_visible", False))
         self.magnifier_dir = cfg.get("magnifier_dir", "右上")
@@ -157,15 +163,6 @@ class FloatLabel(QWidget):
 
         self._drag_pos = None
 
-        # ==========================================
-        # ↓↓↓ 新增：启动后台静默回溯线程 ↓↓↓
-        # ==========================================
-        self.backfill_thread = TrendBackfillThread(self.checked_codes)
-        # 将线程的汇报信号，连接到我们刚刚写的接收方法上
-        self.backfill_thread.data_fetched.connect(self._on_backfill_data)
-        self.backfill_thread.start()
-        # ↑↑↑ ---------------------------------- ↑↑↑
-
         self.timer = QTimer(self)
         self.timer.setInterval(max(1, self.refresh_seconds)*1000)
         self.timer.timeout.connect(self._refresh_from_function)
@@ -227,6 +224,67 @@ class FloatLabel(QWidget):
             self.table.viewport().update()
         except Exception:
             pass
+
+    def _check_and_backfill_missing(self):
+        """智能巡检：基于“数据内生断层”的极致安全检测"""
+        if not hasattr(self, '_backfilled_codes') or not isinstance(self._backfilled_codes, dict):
+            self._backfilled_codes = {} 
+            self._active_threads = []
+
+        missing_codes = []
+        
+        # 定义一个时间转换器：把 "HH:MM" 变成 0~240 的连续分钟刻度
+        # 它的绝妙之处在于能自动把 11:30 和 13:00 缝合在一起
+        def get_m_idx(t_str):
+            try:
+                h, m = map(int, t_str.split(':'))
+                if h < 9 or (h == 9 and m < 30): return 0
+                elif h < 11 or (h == 11 and m <= 30): return (h - 9) * 60 + m - 30
+                elif h >= 13: return 120 + (h - 13) * 60 + m
+                else: return 120
+            except:
+                return 0
+
+        for c in self.checked_codes:
+            # 拿到这只股票目前在内存里的所有时间点
+            hist_entry = getattr(self, 'trend_history', {}).get(c)
+            p_dict = hist_entry.get('p_dict', {}) if hist_entry else {}
+            times = sorted(p_dict.keys())
+            
+            needs_refill = False
+            
+            if len(times) <= 1:
+                # 情况A：刚加的自选股，连 2 个点都凑不齐，毫无疑问必须补全
+                needs_refill = True
+            else:
+                # 情况B：有数据，对比最后收到的两个点
+                t1 = times[-2]
+                t2 = times[-1]
+                
+                # 计算它们在走势图上的物理距离
+                diff = get_m_idx(t2) - get_m_idx(t1)
+                
+                # 如果连续两个点的时间差超过 2 分钟，说明发生了中途取消勾选造成的“断档”
+                if diff > 2:
+                    needs_refill = True
+
+            if needs_refill:
+                attempts = self._backfilled_codes.get(c, 0)
+                if attempts < 5: # 依然保留 5 次熔断保护底线
+                    missing_codes.append(c)
+
+        if not missing_codes:
+            return
+
+        # 登记并派发任务
+        for c in missing_codes:
+            self._backfilled_codes[c] = self._backfilled_codes.get(c, 0) + 1
+        
+        self._active_threads = [t for t in self._active_threads if t.isRunning()]
+        new_thread = TrendBackfillThread(missing_codes)
+        new_thread.data_fetched.connect(self._on_backfill_data)
+        self._active_threads.append(new_thread)
+        new_thread.start()
 
     def set_magnifier_dir(self, direction: str):
         self.magnifier_dir = direction
@@ -654,6 +712,10 @@ class FloatLabel(QWidget):
         self._fit_to_contents()
 
     def _refresh_from_function(self):
+        # ==========================================
+        # ↓↓↓ 新增：每次刷新数据前，先查查有没有新面孔需要补全分时图 ↓↓↓
+        self._check_and_backfill_missing()
+        # ==========================================
         try:
             full_rows, sign = self._get_price(self.checked_codes)
         except Exception as e:
