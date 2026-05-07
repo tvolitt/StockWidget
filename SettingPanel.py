@@ -26,7 +26,7 @@ class SettingsDialog(QDialog):
 
         self.tab_sizes = {
             0: QSize(300, 300),
-            1: QSize(460, 440),
+            1: QSize(460, 460),
             2: QSize(360, 350),
             3: QSize(300, 220),
         }
@@ -183,7 +183,7 @@ class SettingsDialog(QDialog):
         gl_flag_other = QGridLayout(g_flag_other)
         gl_flag_other.setHorizontalSpacing(6)
         gl_flag_other.setVerticalSpacing(6)
-        for i in range(11,12):
+        for i in range(11,13):
             cb = QCheckBox(cb_texts[i])
             cb.setChecked(self.win.header_is_visible(cb_texts[i]))
             cb.stateChanged.connect(partial(self._on_cb_changed, cb_texts[i]))

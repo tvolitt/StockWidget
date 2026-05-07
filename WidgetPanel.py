@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QEvent, QTimer, Signal
 from PySide6.QtGui import QFont, QAction, QColor
 from PySide6.QtWidgets import QApplication, QWidget, QMenu, QVBoxLayout, QLabel, QTableView, QHeaderView, QAbstractItemView, QFrame, QStyledItemDelegate
 
-from Display import SimpleTableModel, KLineDelegate
+from Display import SimpleTableModel, KLineDelegate, TrendDelegate, TrendBackfillThread
 
 class FloatLabel(QWidget):
     hotkey_triggered = Signal()
@@ -53,7 +53,11 @@ class FloatLabel(QWidget):
         # 设置初值
         self.codes = [str(c).strip() for c in codes_cfg if str(c).strip()]
         # 列标题列表（提前定义，供后续旧配置解析使用）
-        self.ALL_HEADERS = ["代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价", "K线"]
+        self.ALL_HEADERS = ["代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价", "分时", "K线"] # <--- 新增"分时"
+        self.trend_history = {} # 本地分时打点缓存库
+
+        # 顺便把旧配置兼容代码里的 self.trend_visible 加上
+        self.trend_visible = bool(cfg.get("trend_visible", False))
 
         # 列显示标志（独立属性）
         # 解析旧 flags 配置以做回退
@@ -125,6 +129,12 @@ class FloatLabel(QWidget):
         self.k_delegate.set_point_size(self.font.pointSize())
         self.k_column_visible_index = None
 
+        # ==========================================
+        # ↓↓↓ 把分时线的 Delegate 初始化挪到这里 ↓↓↓
+        # ==========================================
+        self.trend_delegate = TrendDelegate(self.table, base_pt=12)
+        self.trend_column_visible_index = None
+
         self.vbox.addWidget(self.table)
 
         for w in (self.panel, self.table, self.table.viewport(), self.table.horizontalHeader(), self.table.verticalHeader()):
@@ -146,6 +156,15 @@ class FloatLabel(QWidget):
 
         self._drag_pos = None
 
+        # ==========================================
+        # ↓↓↓ 新增：启动后台静默回溯线程 ↓↓↓
+        # ==========================================
+        self.backfill_thread = TrendBackfillThread(self.checked_codes)
+        # 将线程的汇报信号，连接到我们刚刚写的接收方法上
+        self.backfill_thread.data_fetched.connect(self._on_backfill_data)
+        self.backfill_thread.start()
+        # ↑↑↑ ---------------------------------- ↑↑↑
+
         self.timer = QTimer(self)
         self.timer.setInterval(max(1, self.refresh_seconds)*1000)
         self.timer.timeout.connect(self._refresh_from_function)
@@ -157,6 +176,43 @@ class FloatLabel(QWidget):
         self._keep_top_timer.setInterval(1000)  # 每 1000ms 检查一次
         self._keep_top_timer.timeout.connect(self._ensure_on_top)
         self._keep_top_timer.start()
+
+    def _on_backfill_data(self, code, history_data):
+        """接收后台线程发来的历史分时数据并合并"""
+        if not hasattr(self, 'trend_history'):
+            self.trend_history = {}
+            
+        if code in self.trend_history:
+            local_date = self.trend_history[code]['date']
+            hist_date = history_data['date']
+            
+            if local_date == hist_date:
+                # 日期相同，正常融合（腾讯历史数据打底，新浪最新快照覆盖）
+                merged_p = history_data['p_dict'].copy()
+                merged_a = history_data['a_dict'].copy()
+                merged_p.update(self.trend_history[code]['p_dict'])
+                merged_a.update(self.trend_history[code]['a_dict'])
+                
+                self.trend_history[code]['p_dict'] = merged_p
+                self.trend_history[code]['a_dict'] = merged_a
+                
+            elif local_date > hist_date:
+                # 💡【核心防御拦截】：
+                # 如果本地新浪快照的日期已经是今天（比如 9:15开始），
+                # 而腾讯后台接口还没睡醒，推送的还是昨天的历史数据，直接丢弃，保护今日数据！
+                pass
+                
+            else:
+                # 本地日期落后（跨日隔夜挂机的情况），用后台最新数据覆盖
+                self.trend_history[code] = history_data
+        else:
+            self.trend_history[code] = history_data
+            
+        # 强制触发一次 UI 刷新
+        try:
+            self.table.viewport().update()
+        except Exception:
+            pass
 
     # 与 App 连接
     def set_open_settings_callback(self, fn): 
@@ -183,6 +239,7 @@ class FloatLabel(QWidget):
             "vol_visible": bool(getattr(self, 'vol_visible', False)),
             "amount_visible": bool(getattr(self, 'amount_visible', False)),
             "avg_visible": bool(getattr(self, 'avg_visible', False)),
+            "trend_visible": bool(getattr(self, 'trend_visible', False)), # <--- 新增
             "kline_visible": bool(getattr(self, 'kline_visible', False)),
             "short_code": self.short_code,
             "name_length": self.name_length,
@@ -226,7 +283,9 @@ class FloatLabel(QWidget):
                 return bool(getattr(self, 'amount_visible', False))
             if header == "均价":
                 return bool(getattr(self, 'avg_visible', False))
-            if header == "K线":
+            if header == "分时": 
+                return bool(getattr(self, 'trend_visible', False)) # <--- 新增
+            if header == "K线": 
                 return bool(getattr(self, 'kline_visible', False))
         except Exception:
             pass
@@ -373,6 +432,9 @@ class FloatLabel(QWidget):
             purchaser     = [int(x or 0) for x in parts[10:19:2]]  # 买盘股数
             seller        = [int(x or 0) for x in parts[20:29:2]]  # 卖盘股数
 
+            update_date_str = parts[30]                  # 获取日期字符串 "2023-10-27"
+            update_time = [int(x or 0) for x in parts[31].split(':')]  # 时间
+
             etf = code[2] in ('1','5')
             dec = 3 if etf else 2
             
@@ -444,6 +506,27 @@ class FloatLabel(QWidget):
                 if current_price == high_price: arrow = "↑"
                 elif current_price == low_price: arrow = "↓"
 
+            # ------ 新增：分时数据本地打点逻辑 ------
+            minute_str = f"{update_time[0]:02d}:{update_time[1]:02d}"
+            
+            if code not in self.trend_history:
+                self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
+            
+            if self.trend_history[code]['date'] != update_date_str:
+                self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
+            
+            self.trend_history[code]['p_dict'][minute_str] = current_price
+            self.trend_history[code]['a_dict'][minute_str] = avg
+
+            # 提取排序后的时间，确保时间的绝对先后顺序
+            sorted_times = sorted(self.trend_history[code]['p_dict'].keys())
+            prices_list = [self.trend_history[code]['p_dict'][t] for t in sorted_times]
+            avgs_list = [self.trend_history[code]['a_dict'].get(t, prices_list[i]) for i, t in enumerate(sorted_times)]
+            
+            # 【💣这里是最容易漏掉的地方！必须确保括号里有 sorted_times，一共 4 个变量】
+            trend_payload = {"trend": (prev_close, sorted_times, prices_list, avgs_list)}
+            # ----------------------------------------
+
             k_payload = {"k": (opening_price, current_price, high_price, low_price, prev_close)}
             
             # 格式化列表数据
@@ -459,6 +542,7 @@ class FloatLabel(QWidget):
                 f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
                 f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
                 f"{avg:.{dec}f}",
+                trend_payload,   # <----- 分时图
                 k_payload
             ]
             price_data.append(row)
@@ -481,10 +565,24 @@ class FloatLabel(QWidget):
             proj_meta.append(sign_data[r])
 
         # 右对齐：除了名称、K线、卖一外的所有列都右对齐
-        right_cols = [i for i, h in enumerate(headers) if h not in ("名称", "K线", "卖一")]
+        right_cols = [i for i, h in enumerate(headers) if h not in ("名称", "分时", "K线", "卖一")]
         self.model.set_align_right_cols(right_cols)
         self.model.set_rows_headers(proj_rows, headers, meta=proj_meta)
         self.model.set_color_scheme(self.default_color, self.fg)
+
+        # 【核心修复1】：暴力重置所有列的代理，彻底清除因取消勾选导致的“图表残影”
+        for c in range(self.model.columnCount()):
+            self.table.setItemDelegateForColumn(c, QStyledItemDelegate(self.table))
+
+        # 【核心修复2】：K线和分时变成两个平行的 if 独立判断，互不干扰
+        if "分时" in headers:
+            col = headers.index("分时")
+            self.trend_column_visible_index = col
+            self.trend_delegate.update_scheme(self.default_color, self.fg)
+            self.trend_delegate.set_point_size(self.font.pointSize())
+            self.table.setItemDelegateForColumn(col, self.trend_delegate)
+        else:
+            self.trend_column_visible_index = None
 
         if "K线" in headers:
             col = headers.index("K线")
@@ -493,9 +591,7 @@ class FloatLabel(QWidget):
             self.k_delegate.set_point_size(self.font.pointSize())
             self.table.setItemDelegateForColumn(col, self.k_delegate)
         else:
-            if self.k_column_visible_index is not None:
-                self.table.setItemDelegateForColumn(self.k_column_visible_index, QStyledItemDelegate(self.table))
-                self.k_column_visible_index = None
+            self.k_column_visible_index = None
 
         self._fit_to_contents()
 
@@ -584,6 +680,8 @@ class FloatLabel(QWidget):
                 prev = bool(getattr(self, 'amount_visible', False)); self.amount_visible = checked
             elif header == "均价":
                 prev = bool(getattr(self, 'avg_visible', False)); self.avg_visible = checked
+            elif header == "分时":
+                prev = bool(getattr(self, 'trend_visible', False)); self.trend_visible = checked
             elif header == "K线":
                 prev = bool(getattr(self, 'kline_visible', False)); self.kline_visible = checked
         except Exception:

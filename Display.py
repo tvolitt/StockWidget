@@ -1,6 +1,9 @@
+import json, time
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtCore import Qt, QRect, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush
 from PySide6.QtWidgets import QStyledItemDelegate
+from PySide6.QtGui import QPainterPath
 
 # ----- 颜色配置 -----
 UP_COLOR = QColor("#dd2100")
@@ -37,8 +40,13 @@ class SimpleTableModel(QAbstractTableModel):
         cell = "" if c >= len(self._rows[r]) else self._rows[r][c]
 
         if role == Qt.UserRole:
-            if isinstance(cell, dict) and "k" in cell:
-                return cell["k"]
+            if isinstance(cell, dict):
+                # 如果是K线，返回K线需要的元组
+                if "k" in cell:
+                    return cell["k"]
+                # 如果是分时线，直接返回整个字典
+                if "trend" in cell:
+                    return cell
             return None
 
         if role == Qt.DisplayRole:
@@ -179,3 +187,209 @@ class KLineDelegate(QStyledItemDelegate):
             painter.fillRect(body_x, top, body_w, body_h, QBrush(kcolor))
 
         painter.restore()
+
+class TrendDelegate(QStyledItemDelegate):
+    """
+    分时线图（含均价线），采用本地数据打点
+    """
+    def __init__(self, parent=None, base_pt=12):
+        super().__init__(parent)
+        self.default_color = False
+        self.fg = QColor("#FFFFFF")
+        self.vwap_color = QColor("#F6D32A")  # 经典的分时均价黄线
+        self.scale = 1.0
+        self.base_pt = max(1, int(base_pt))
+
+    def update_scheme(self, default_color: bool, fg: QColor):
+        self.default_color = bool(default_color)
+        self.fg = QColor(fg)
+
+    # ==========================================
+    # ↓↓↓ 把下面这个缺失的方法粘贴到这里 ↓↓↓
+    # ==========================================
+    def set_point_size(self, pt: int):
+        """根据当前的字体大小，动态计算画笔的缩放比例"""
+        self.scale = max(0.5, min(1.5, float(pt) / float(self.base_pt)))
+    # ==========================================
+
+    def paint(self, painter: QPainter, option, index):
+        data = index.data(Qt.UserRole)
+        # 验证数据结构
+        if not data or not isinstance(data, dict) or "trend" not in data:
+            super().paint(painter, option, index)
+            return
+
+        trend_data = data["trend"]
+        # 兼容保护：提取时间戳
+        if len(trend_data) == 4:
+            prev_close, times, prices, avgs = trend_data
+        else:
+            return  # 如果数据还没刷新过来，直接跳过
+
+        if not prices:
+            return
+
+        cell = option.rect
+        rect = cell.adjusted(2, 2, -2, -2)
+
+        painter.save()
+        painter.setClipRect(cell)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        max_p = max(max(prices), max(avgs)) if avgs else max(prices)
+        min_p = min(min(prices), min(avgs)) if avgs else min(prices)
+        max_diff = max(abs(max_p - prev_close), abs(min_p - prev_close))
+        max_diff = max_diff * 1.05 if max_diff > 0 else prev_close * 0.01
+
+        y_max = prev_close + max_diff
+        y_min = prev_close - max_diff
+
+        def get_y(val):
+            ratio = (val - y_min) / (y_max - y_min) if y_max > y_min else 0.5
+            return rect.bottom() - ratio * rect.height()
+
+        # 【核心黑科技：A股 240 分钟绝对坐标转换器】
+        def get_x(idx):
+            if times and idx < len(times):
+                t_str = times[idx]
+                try:
+                    h, m = map(int, t_str.split(':'))
+                    if h < 9 or (h == 9 and m < 30):
+                        m_idx = 0                  # 集合竞价和盘前
+                    elif h < 11 or (h == 11 and m <= 30):
+                        m_idx = (h - 9) * 60 + m - 30  # 上午盘
+                    elif h >= 13:
+                        m_idx = 120 + (h - 13) * 60 + m # 下午盘
+                    else:
+                        m_idx = 120                # 午休期间
+                except:
+                    m_idx = 0
+            else:
+                m_idx = idx
+
+            # 强行把 X 轴锁定在 240 等份，绝不拉伸！
+            m_idx = max(0, min(240, m_idx))
+            return rect.left() + (m_idx / 240.0) * rect.width()
+
+        # 画昨收基准虚线 (0% 轴)
+        y_prev = get_y(prev_close)
+        dash_col = QColor(NEUTRAL_COLOR if self.default_color else self.fg)
+        dash_col.setAlpha(100)
+        painter.setPen(QPen(dash_col, 1, Qt.DashLine))
+        painter.drawLine(rect.left(), int(y_prev), rect.right(), int(y_prev))
+
+        total_pts = len(prices)
+        if total_pts == 0:
+            painter.restore()
+            return
+
+        # 刚开盘时的单点处理
+        if total_pts == 1:
+            px = get_x(0)
+            py = get_y(prices[0])
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(self.fg)
+            painter.drawEllipse(int(px) - 2, int(py) - 2, 4, 4)
+            painter.restore()
+            return
+
+        # 画均价线（黄线）
+        if avgs and len(avgs) == total_pts:
+            path_avg = QPainterPath()
+            path_avg.moveTo(get_x(0), get_y(avgs[0]))
+            for i in range(1, total_pts):
+                path_avg.lineTo(get_x(i), get_y(avgs[i]))
+
+            painter.setPen(QPen(self.vwap_color, max(1, int(1.2 * self.scale))))
+            painter.drawPath(path_avg)
+
+        # 画分时价格线
+        line_color = self.fg
+        if self.default_color:
+            current = prices[-1]
+            if current > prev_close: line_color = UP_COLOR
+            elif current < prev_close: line_color = DOWN_COLOR
+            else: line_color = NEUTRAL_COLOR
+
+        path_price = QPainterPath()
+        path_price.moveTo(get_x(0), get_y(prices[0]))
+        for i in range(1, total_pts):
+            path_price.lineTo(get_x(i), get_y(prices[i]))
+
+        painter.setPen(QPen(line_color, max(1, int(1.5 * self.scale))))
+        painter.drawPath(path_price)
+
+        painter.restore()
+
+class TrendBackfillThread(QThread):
+    """
+    后台静默回溯线程：负责在软件启动时，按部就班地拉取当天的历史分时数据。
+    绝对安全策略：每拉取一只股票，强制休眠 0.5 秒，伪装成人类点击，绝不触发反爬封号。
+    """
+    # 定义信号：拉取成功一只，就向主线程汇报一只 (股票代码, 历史数据字典)
+    data_fetched = Signal(str, dict)
+
+    def __init__(self, codes):
+        super().__init__()
+        self.codes = codes
+
+    def run(self):
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        
+        for code in self.codes:
+            if not code: continue
+            try:
+                # 腾讯 m1 接口
+                url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={code},m1,,240"
+                import requests
+                r = requests.get(url, headers=headers, timeout=5)
+                data = r.json()
+                
+                m1_data = data.get('data', {}).get(code, {}).get('m1', [])
+                if not m1_data:
+                    continue
+                
+                # 【核心修复 1】精准提取“真实的最新交易日” (如 "20231027")
+                latest_date_raw = m1_data[-1][0][:8]
+                # 转换成与新浪快照完美匹配的格式 "2023-10-27"，防止周末被意外清空
+                true_date_str = f"{latest_date_raw[:4]}-{latest_date_raw[4:6]}-{latest_date_raw[6:]}"
+                
+                p_dict = {}
+                a_dict = {}
+                cum_vol = 0.0
+                cum_amt = 0.0
+                
+                for item in m1_data:
+                    # 【核心修复 2】时间轴净化：无情过滤掉所有非今天(昨天/前天)的 240 根残留 K 线
+                    if not item[0].startswith(latest_date_raw):
+                        continue
+                        
+                    time_raw = item[0][-4:]
+                    time_str = f"{time_raw[:2]}:{time_raw[2:]}"
+                    
+                    # 【核心修复 3】索引 2 才是该分钟的真实收盘价 (之前误用了 4 最低价)
+                    price = float(item[2])
+                    vol = float(item[5])
+                    
+                    # 均价计算保持不变
+                    cum_vol += vol
+                    cum_amt += price * vol 
+                    avg = cum_amt / cum_vol if cum_vol > 0 else price
+                    
+                    p_dict[time_str] = price
+                    a_dict[time_str] = avg
+                
+                # 组装正确的数据结构传给前台
+                history_data = {
+                    'date': true_date_str, 
+                    'p_dict': p_dict,
+                    'a_dict': a_dict
+                }
+                
+                self.data_fetched.emit(code, history_data)
+                
+            except Exception as e:
+                pass
+            
+            # 护身符：慢慢拉取，绝不封号
+            time.sleep(0.5)
