@@ -26,7 +26,7 @@ class SettingsDialog(QDialog):
 
         self.tab_sizes = {
             0: QSize(300, 300),
-            1: QSize(460, 460),
+            1: QSize(460, 500),
             2: QSize(360, 350),
             3: QSize(300, 220),
         }
@@ -189,6 +189,20 @@ class SettingsDialog(QDialog):
             cb.stateChanged.connect(partial(self._on_cb_changed, cb_texts[i]))
             self.cbs.append(cb)
             gl_flag_other.addWidget(cb, i-11, 0)
+
+        # 创建一个水平子布局装文字和下拉框
+        layout_mag_dir = QHBoxLayout()
+        layout_mag_dir.addWidget(QLabel("放大图位置:"))
+        
+        self.cmb_mag_dir = QComboBox()
+        self.cmb_mag_dir.addItems(["左上", "右上", "左下", "右下"])
+        self.cmb_mag_dir.setCurrentText(getattr(self.win, 'magnifier_dir', '右下'))
+        self.cmb_mag_dir.currentTextChanged.connect(self.win.set_magnifier_dir)
+        layout_mag_dir.addWidget(self.cmb_mag_dir)
+        
+        # 你的复选框占了网格的第 0 行和第 1 行，我们把这个加到第 2 行，第 0 列
+        gl_flag_other.addLayout(layout_mag_dir, 2, 0)
+
         gl_flags.addWidget(g_flag_other, 2, 0)
 
         data_settings.addWidget(g_flags)

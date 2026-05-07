@@ -2,10 +2,10 @@ import requests, keyboard
 from functools import partial
 
 from PySide6.QtCore import Qt, QEvent, QTimer, Signal
-from PySide6.QtGui import QFont, QAction, QColor
+from PySide6.QtGui import QFont, QAction, QColor, QCursor
 from PySide6.QtWidgets import QApplication, QWidget, QMenu, QVBoxLayout, QLabel, QTableView, QHeaderView, QAbstractItemView, QFrame, QStyledItemDelegate
 
-from Display import SimpleTableModel, KLineDelegate, TrendDelegate, TrendBackfillThread
+from Display import SimpleTableModel, KLineDelegate, TrendDelegate, TrendBackfillThread, TrendMagnifierWindow
 
 class FloatLabel(QWidget):
     hotkey_triggered = Signal()
@@ -58,6 +58,7 @@ class FloatLabel(QWidget):
 
         # 顺便把旧配置兼容代码里的 self.trend_visible 加上
         self.trend_visible = bool(cfg.get("trend_visible", False))
+        self.magnifier_dir = cfg.get("magnifier_dir", "右上")
 
         # 列显示标志（独立属性）
         # 解析旧 flags 配置以做回退
@@ -177,6 +178,19 @@ class FloatLabel(QWidget):
         self._keep_top_timer.timeout.connect(self._ensure_on_top)
         self._keep_top_timer.start()
 
+        # 1. 实例化放大镜窗口
+        self.magnifier = TrendMagnifierWindow()
+        
+        # 2. 悬停定时器（1000 毫秒 = 1秒）
+        self.hover_timer = QTimer(self)
+        self.hover_timer.setSingleShot(True)
+        self.hover_timer.timeout.connect(self._show_magnifier)
+        self.current_hover_index = None
+
+        # 3. 开启表格的鼠标追踪（否则鼠标只有按住才会触发事件）
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
+
     def _on_backfill_data(self, code, history_data):
         """接收后台线程发来的历史分时数据并合并"""
         if not hasattr(self, 'trend_history'):
@@ -214,6 +228,49 @@ class FloatLabel(QWidget):
         except Exception:
             pass
 
+    def set_magnifier_dir(self, direction: str):
+        self.magnifier_dir = direction
+        self._notify_change()
+
+    def _show_magnifier(self):
+        """定时器到期时执行，显示放大版分时图"""
+        if not self.current_hover_index or not self.current_hover_index.isValid():
+            return
+            
+        data = self.current_hover_index.data(Qt.UserRole)
+        if data and isinstance(data, dict) and "trend" in data:
+            
+            # ==========================================
+            # ↓↓↓ 修改这行：把背景色 self.bg 和 整体透明度 传进去 ↓↓↓
+            # ==========================================
+            self.magnifier.set_data(
+                data["trend"], 
+                self.fg, 
+                self.bg, 
+                self.windowOpacity()
+            )
+            # ==========================================
+            
+            pos = QCursor.pos()
+            offset = 15  # 留出15像素防误触
+            w, h = self.magnifier.width(), self.magnifier.height()
+            
+            direction = getattr(self, 'magnifier_dir', '右上')
+            
+            if direction == '左上':
+                x, y = pos.x() - w - offset, pos.y() - h - offset
+            elif direction == '右上':
+                x, y = pos.x() + offset, pos.y() - h - offset
+            elif direction == '左下':
+                x, y = pos.x() - w - offset, pos.y() + offset
+            else: # 默认 右下
+                x, y = pos.x() + offset, pos.y() + offset
+                
+            self.magnifier.move(x, y)
+            # ↑↑↑ ---------------------------------- ↑↑↑
+            
+            self.magnifier.show()
+
     # 与 App 连接
     def set_open_settings_callback(self, fn): 
         self._open_settings_cb = fn
@@ -240,6 +297,7 @@ class FloatLabel(QWidget):
             "amount_visible": bool(getattr(self, 'amount_visible', False)),
             "avg_visible": bool(getattr(self, 'avg_visible', False)),
             "trend_visible": bool(getattr(self, 'trend_visible', False)), # <--- 新增
+            "magnifier_dir": getattr(self, "magnifier_dir", "右上"),
             "kline_visible": bool(getattr(self, 'kline_visible', False)),
             "short_code": self.short_code,
             "name_length": self.name_length,
@@ -854,6 +912,30 @@ class FloatLabel(QWidget):
             self.hide()
 
     def eventFilter(self, obj, ev):
+        # 💡 [新增区块] 监控鼠标在表格上的悬停动作
+        if obj is self.table.viewport():
+            if ev.type() == QEvent.MouseMove:
+                pos = ev.pos()
+                index = self.table.indexAt(pos)
+                
+                # 检查鼠标是否停留在“分时”列
+                if index.isValid() and getattr(self, "trend_column_visible_index", None) == index.column():
+                    if index != self.current_hover_index:
+                        # 换了股票，重新开始 1 秒倒计时
+                        self.current_hover_index = index
+                        self.magnifier.hide()
+                        self.hover_timer.start(1000) 
+                else:
+                    # 移出了“分时”列，关闭放大镜
+                    self.current_hover_index = None
+                    self.hover_timer.stop()
+                    self.magnifier.hide()
+                    
+            elif ev.type() == QEvent.Leave:
+                # 鼠标彻底离开表格区域
+                self.current_hover_index = None
+                self.hover_timer.stop()
+                self.magnifier.hide()
         if ev.type() == QEvent.MouseButtonDblClick and hasattr(ev, "button") and ev.button() == Qt.LeftButton:
             self._drag_pos = None
             self.hide()
