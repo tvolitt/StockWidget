@@ -504,7 +504,7 @@ class FloatLabel(QWidget):
             except Exception:
                 pass
 
-# ----- 数据来源：新浪财经 -----
+    # ----- 数据来源：新浪财经 -----
     def _get_price(self, codes:list):
         label = ",".join([str(c).strip() for c in codes if str(c).strip()])
         if not label:
@@ -547,6 +547,18 @@ class FloatLabel(QWidget):
             deals_amt     = float(parts[9] or 0)
             purchaser     = [int(x or 0) for x in parts[10:19:2]]  # 买盘股数
             seller        = [int(x or 0) for x in parts[20:29:2]]  # 卖盘股数
+
+            # ==========================================
+            # ↓↓↓ 新增：集合竞价“智能替补”逻辑 ↓↓↓
+            # ==========================================
+            if current_price == 0.0:
+                if first_pur > 0:
+                    current_price = first_pur
+                elif first_sell > 0:
+                    current_price = first_sell
+                else:
+                    current_price = prev_close
+            # ==========================================
 
             update_date_str = parts[30]                  # 获取日期字符串 "2023-10-27"
             update_time = [int(x or 0) for x in parts[31].split(':')]  # 时间
@@ -610,7 +622,7 @@ class FloatLabel(QWidget):
                 b1_color_sign, s1_color_sign = 1, -1
 
             # 补全其他数据逻辑...
-            if current_price == 0: current_price = prev_close
+            # (这里删除了原来的 if current_price == 0: ... 防止与上方的替补逻辑冲突)
             change = current_price - prev_close if prev_close else 0.0
             change_pct = (current_price / prev_close - 1) * 100 if prev_close else 0.0
             avg = (deals_amt / deals_vol) if deals_vol > 0 else prev_close
@@ -631,6 +643,7 @@ class FloatLabel(QWidget):
             if self.trend_history[code]['date'] != update_date_str:
                 self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
             
+            # 这里因为 current_price 已经替补了撮合价，竞价曲线再也不会跌到 0 了！
             self.trend_history[code]['p_dict'][minute_str] = current_price
             self.trend_history[code]['a_dict'][minute_str] = avg
 
@@ -639,7 +652,6 @@ class FloatLabel(QWidget):
             prices_list = [self.trend_history[code]['p_dict'][t] for t in sorted_times]
             avgs_list = [self.trend_history[code]['a_dict'].get(t, prices_list[i]) for i, t in enumerate(sorted_times)]
             
-            # 【💣这里是最容易漏掉的地方！必须确保括号里有 sorted_times，一共 4 个变量】
             trend_payload = {"trend": (prev_close, sorted_times, prices_list, avgs_list)}
             # ----------------------------------------
 
@@ -647,8 +659,8 @@ class FloatLabel(QWidget):
             
             # 格式化列表数据
             row = [
-                code[2:] if self.short_code else code,
-                name if self.name_length == 0 else name[:self.name_length],
+                code[2:] if getattr(self, 'short_code', False) else code,
+                name if getattr(self, 'name_length', 0) == 0 else name[:self.name_length],
                 f"{current_price:.{dec}f}{arrow}",
                 f"{change:+.{dec}f}",
                 f"{change_pct:+.2f}%",

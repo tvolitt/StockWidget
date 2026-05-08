@@ -1,4 +1,5 @@
 import json, time
+import requests
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtCore import Qt, QRect, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush
@@ -323,10 +324,8 @@ class TrendDelegate(QStyledItemDelegate):
 
 class TrendBackfillThread(QThread):
     """
-    后台静默回溯线程：负责在软件启动时，按部就班地拉取当天的历史分时数据。
-    绝对安全策略：每拉取一只股票，强制休眠 0.5 秒，伪装成人类点击，绝不触发反爬封号。
+    后台静默回溯线程：自带终极防崩溃装甲
     """
-    # 定义信号：拉取成功一只，就向主线程汇报一只 (股票代码, 历史数据字典)
     data_fetched = Signal(str, dict)
 
     def __init__(self, codes):
@@ -341,7 +340,6 @@ class TrendBackfillThread(QThread):
             try:
                 # 腾讯 m1 接口
                 url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={code},m1,,240"
-                import requests
                 r = requests.get(url, headers=headers, timeout=5)
                 data = r.json()
                 
@@ -349,9 +347,7 @@ class TrendBackfillThread(QThread):
                 if not m1_data:
                     continue
                 
-                # 【核心修复 1】精准提取“真实的最新交易日” (如 "20231027")
                 latest_date_raw = m1_data[-1][0][:8]
-                # 转换成与新浪快照完美匹配的格式 "2023-10-27"，防止周末被意外清空
                 true_date_str = f"{latest_date_raw[:4]}-{latest_date_raw[4:6]}-{latest_date_raw[6:]}"
                 
                 p_dict = {}
@@ -359,27 +355,43 @@ class TrendBackfillThread(QThread):
                 cum_vol = 0.0
                 cum_amt = 0.0
                 
+                # ==========================================
+                # 🛡️ 核心护盾：安全转换器，遇到任何脏数据一律按 0 处理，绝不崩溃
+                # ==========================================
+                def to_f(val):
+                    try: return float(val)
+                    except: return 0.0
+
                 for item in m1_data:
-                    # 【核心修复 2】时间轴净化：无情过滤掉所有非今天(昨天/前天)的 240 根残留 K 线
                     if not item[0].startswith(latest_date_raw):
                         continue
                         
                     time_raw = item[0][-4:]
                     time_str = f"{time_raw[:2]}:{time_raw[2:]}"
                     
-                    # 【核心修复 3】索引 2 才是该分钟的真实收盘价 (之前误用了 4 最低价)
-                    price = float(item[2])
-                    vol = float(item[5])
+                    # 🛡️ 长度越界保护：哪怕腾讯接口抽风只返回3个数据，也能安全截断
+                    open_p  = to_f(item[1]) if len(item) > 1 else 0.0
+                    close_p = to_f(item[2]) if len(item) > 2 else open_p
+                    high_p  = to_f(item[3]) if len(item) > 3 else close_p
+                    low_p   = to_f(item[4]) if len(item) > 4 else close_p
+                    vol     = to_f(item[5]) if len(item) > 5 else 0.0
                     
-                    # 均价计算保持不变
+                    minute_amt = 0.0
+                    if len(item) >= 7:
+                        minute_amt = to_f(item[6])
+                        
+                    # 真正的均价核心修复
+                    if minute_amt <= 0:
+                        minute_avg = (open_p + close_p + high_p + low_p) / 4.0
+                        minute_amt = minute_avg * vol
+                        
                     cum_vol += vol
-                    cum_amt += price * vol 
-                    avg = cum_amt / cum_vol if cum_vol > 0 else price
+                    cum_amt += minute_amt 
+                    avg = cum_amt / cum_vol if cum_vol > 0 else close_p
                     
-                    p_dict[time_str] = price
+                    p_dict[time_str] = close_p
                     a_dict[time_str] = avg
                 
-                # 组装正确的数据结构传给前台
                 history_data = {
                     'date': true_date_str, 
                     'p_dict': p_dict,
@@ -389,7 +401,8 @@ class TrendBackfillThread(QThread):
                 self.data_fetched.emit(code, history_data)
                 
             except Exception as e:
-                pass
+                # 💡 新增打印：以后如果再出问题，控制台会明明白白告诉你哪里报错，不再瞎猜
+                print(f"后台拉取 {code} 历史分时发生错误: {e}")
             
             # 护身符：慢慢拉取，绝不封号
             time.sleep(0.5)
@@ -413,8 +426,13 @@ class TrendMagnifierWindow(QWidget):
     def set_data(self, trend_data, fg_color, bg_color, opacity: float):
         self.trend_data = trend_data
         self.fg = fg_color
-        self.bg = bg_color  # 接收主窗口的背景色（自带透明度 alpha）
-        self.setWindowOpacity(opacity)  # 接收主窗口的整体透明度
+        
+        # ==========================================
+        # ↓↓↓ 核心修改：锁定纯黑 RGB，但吸取原背景的 Alpha(透明度) ↓↓↓
+        # ==========================================
+        self.bg = QColor(0, 0, 0)
+
+        # self.setWindowOpacity(opacity)  # 接收主窗口的整体透明度
         self.update()
 
     def paintEvent(self, event):
@@ -427,7 +445,7 @@ class TrendMagnifierWindow(QWidget):
         rect = self.rect()
         
         # 1. 背景与边框
-        painter.fillRect(rect, getattr(self, 'bg', QColor(20, 20, 20, 230)))
+        painter.fillRect(rect, QColor(0, 0, 0))
         border_color = QColor(self.fg.red(), self.fg.green(), self.fg.blue(), 80)
         painter.setPen(QPen(border_color, 1))
         painter.drawRect(0, 0, rect.width()-1, rect.height()-1)
@@ -563,7 +581,7 @@ class TrendMagnifierWindow(QWidget):
                              tw + bg_pad_x * 2, th + bg_pad_y * 2)
             
             # 4. 画底色和边框
-            painter.fillRect(tag_rect, getattr(self, 'bg', QColor(20, 20, 20, 230)))
+            painter.fillRect(tag_rect, QColor(0, 0, 0, 0))
             painter.setPen(color)
             
             # 5. 分段画文字 (完美居中对齐)
