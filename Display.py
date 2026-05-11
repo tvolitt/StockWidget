@@ -324,7 +324,7 @@ class TrendDelegate(QStyledItemDelegate):
 
 class TrendBackfillThread(QThread):
     """
-    后台静默回溯线程：自带终极防崩溃装甲
+    后台静默回溯线程：采用东方财富原生分时接口，获取交易所绝对精确均价，消灭一切计算毛刺。
     """
     data_fetched = Signal(str, dict)
 
@@ -338,60 +338,50 @@ class TrendBackfillThread(QThread):
         for code in self.codes:
             if not code: continue
             try:
-                # 腾讯 m1 接口
-                url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={code},m1,,240"
+                # 1. 转换代码格式以适配东方财富API (sh开头转为1.，sz/bj转为0.)
+                prefix = code[:2].lower()
+                ticker = code[2:]
+                secid = f"1.{ticker}" if prefix == 'sh' else f"0.{ticker}"
+                
+                # 2. 绝密武器：调用东财原生【分时】接口（而非K线接口）
+                # fields2 中: f52=现价, f56=成交量, f57=成交额, f58=精确均价！
+                url = f"http://push2his.eastmoney.com/api/qt/stock/trends2/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=1&iscr=0&iscca=0"
+                
                 r = requests.get(url, headers=headers, timeout=5)
                 data = r.json()
                 
-                m1_data = data.get('data', {}).get(code, {}).get('m1', [])
-                if not m1_data:
+                # 3. 容错解析数据
+                if not data or not data.get('data'):
                     continue
-                
-                latest_date_raw = m1_data[-1][0][:8]
-                true_date_str = f"{latest_date_raw[:4]}-{latest_date_raw[4:6]}-{latest_date_raw[6:]}"
+                    
+                trends = data['data'].get('trends', [])
+                if not trends:
+                    continue
+                    
+                # 提取正确的交易日期 (如 "2023-10-27")
+                first_time = trends[0].split(',')[0]
+                true_date_str = first_time.split(' ')[0]
                 
                 p_dict = {}
                 a_dict = {}
-                cum_vol = 0.0
-                cum_amt = 0.0
                 
-                # ==========================================
-                # 🛡️ 核心护盾：安全转换器，遇到任何脏数据一律按 0 处理，绝不崩溃
-                # ==========================================
-                def to_f(val):
-                    try: return float(val)
-                    except: return 0.0
-
-                for item in m1_data:
-                    if not item[0].startswith(latest_date_raw):
+                for item in trends:
+                    parts = item.split(',')
+                    if len(parts) < 8:
                         continue
                         
-                    time_raw = item[0][-4:]
-                    time_str = f"{time_raw[:2]}:{time_raw[2:]}"
+                    # 时间解析 (保留 "09:30" 格式)
+                    full_time = parts[0]
+                    time_str = full_time.split(' ')[1]
                     
-                    # 🛡️ 长度越界保护：哪怕腾讯接口抽风只返回3个数据，也能安全截断
-                    open_p  = to_f(item[1]) if len(item) > 1 else 0.0
-                    close_p = to_f(item[2]) if len(item) > 2 else open_p
-                    high_p  = to_f(item[3]) if len(item) > 3 else close_p
-                    low_p   = to_f(item[4]) if len(item) > 4 else close_p
-                    vol     = to_f(item[5]) if len(item) > 5 else 0.0
+                    # 🛡️ 降维打击：直接拿东财算好的均价，一分钱都不会差！
+                    price = float(parts[2])  # 现价
+                    avg = float(parts[7])    # 绝对精确的 VWAP 均价
                     
-                    minute_amt = 0.0
-                    if len(item) >= 7:
-                        minute_amt = to_f(item[6])
-                        
-                    # 真正的均价核心修复
-                    if minute_amt <= 0:
-                        minute_avg = (open_p + close_p + high_p + low_p) / 4.0
-                        minute_amt = minute_avg * vol
-                        
-                    cum_vol += vol
-                    cum_amt += minute_amt 
-                    avg = cum_amt / cum_vol if cum_vol > 0 else close_p
-                    
-                    p_dict[time_str] = close_p
+                    p_dict[time_str] = price
                     a_dict[time_str] = avg
                 
+                # 组装正确的数据结构传给前台
                 history_data = {
                     'date': true_date_str, 
                     'p_dict': p_dict,
@@ -401,7 +391,6 @@ class TrendBackfillThread(QThread):
                 self.data_fetched.emit(code, history_data)
                 
             except Exception as e:
-                # 💡 新增打印：以后如果再出问题，控制台会明明白白告诉你哪里报错，不再瞎猜
                 print(f"后台拉取 {code} 历史分时发生错误: {e}")
             
             # 护身符：慢慢拉取，绝不封号
