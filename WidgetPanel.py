@@ -636,6 +636,13 @@ class FloatLabel(QWidget):
 
             # ------ 新增：分时数据本地打点逻辑 ------
             minute_str = f"{update_time[0]:02d}:{update_time[1]:02d}"
+
+            # ==========================================
+            # ↓↓↓ 新增核心修复：集合竞价“时间压缩”，消除垂直毛刺 ↓↓↓
+            # ==========================================
+            if minute_str < "09:30":
+                minute_str = "09:30"
+            # ==========================================
             
             if code not in self.trend_history:
                 self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
