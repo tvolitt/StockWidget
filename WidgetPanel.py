@@ -189,20 +189,26 @@ class FloatLabel(QWidget):
         self.table.viewport().setMouseTracking(True)
 
     def _on_backfill_data(self, code, history_data):
-        """接收后台线程发来的历史分时数据并合并"""
+        """接收后台线程发来的历史分时数据并智能合并"""
         if not hasattr(self, 'trend_history'):
             self.trend_history = {}
             
         if code in self.trend_history:
-            local_date = self.trend_history[code]['date']
-            hist_date = history_data['date']
+            local_date = self.trend_history[code].get('date', '')
+            hist_date = history_data.get('date', '')
             
             if local_date == hist_date:
-                # 日期相同，正常融合（腾讯历史数据打底，新浪最新快照覆盖）
-                merged_p = history_data['p_dict'].copy()
-                merged_a = history_data['a_dict'].copy()
-                merged_p.update(self.trend_history[code]['p_dict'])
-                merged_a.update(self.trend_history[code]['a_dict'])
+                # 💡【神级缝合术】：主客易位
+                # 1. 先把本地的新浪快照数据拿出来打底（这里可能包含刚刚推的最新的 1 秒钟的数据）
+                merged_p = self.trend_history[code]['p_dict'].copy()
+                merged_a = self.trend_history[code]['a_dict'].copy()
+                
+                # 2. 用东方财富的完整历史数据去“填坑和覆盖”！
+                # 魔法原理：如果中间断档了，东财数据会填补空白；
+                # 如果早上本地算错均价了，东财的精确均价会直接将其纠正覆盖；
+                # 如果本地有 14:01 的最新点而东财只有 14:00，14:01 会安全保留！
+                merged_p.update(history_data.get('p_dict', {}))
+                merged_a.update(history_data.get('a_dict', {}))
                 
                 self.trend_history[code]['p_dict'] = merged_p
                 self.trend_history[code]['a_dict'] = merged_a
@@ -210,13 +216,14 @@ class FloatLabel(QWidget):
             elif local_date > hist_date:
                 # 💡【核心防御拦截】：
                 # 如果本地新浪快照的日期已经是今天（比如 9:15开始），
-                # 而腾讯后台接口还没睡醒，推送的还是昨天的历史数据，直接丢弃，保护今日数据！
+                # 而后台接口还没睡醒，推送的还是昨天的历史数据，直接丢弃，保护今日数据！
                 pass
                 
             else:
-                # 本地日期落后（跨日隔夜挂机的情况），用后台最新数据覆盖
+                # 本地日期落后（跨日隔夜挂机的情况），用后台最新数据彻底覆盖
                 self.trend_history[code] = history_data
         else:
+            # 内存完全没这只股票，直接存入
             self.trend_history[code] = history_data
             
         # 强制触发一次 UI 刷新
