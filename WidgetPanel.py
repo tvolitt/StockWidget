@@ -233,7 +233,7 @@ class FloatLabel(QWidget):
             pass
 
     def _check_and_backfill_missing(self):
-        """智能巡检：基于“数据内生断层”的极致安全检测"""
+        """智能巡检：全局 X 光断层扫描，绝不放过任何一个历史缝隙"""
         if not hasattr(self, '_backfilled_codes') or not isinstance(self._backfilled_codes, dict):
             self._backfilled_codes = {} 
             self._active_threads = []
@@ -241,7 +241,6 @@ class FloatLabel(QWidget):
         missing_codes = []
         
         # 定义一个时间转换器：把 "HH:MM" 变成 0~240 的连续分钟刻度
-        # 它的绝妙之处在于能自动把 11:30 和 13:00 缝合在一起
         def get_m_idx(t_str):
             try:
                 h, m = map(int, t_str.split(':'))
@@ -261,23 +260,23 @@ class FloatLabel(QWidget):
             needs_refill = False
             
             if len(times) <= 1:
-                # 情况A：刚加的自选股，连 2 个点都凑不齐，毫无疑问必须补全
+                # 情况A：刚加的自选股，必须补全
                 needs_refill = True
             else:
-                # 情况B：有数据，对比最后收到的两个点
-                t1 = times[-2]
-                t2 = times[-1]
-                
-                # 计算它们在走势图上的物理距离
-                diff = get_m_idx(t2) - get_m_idx(t1)
-                
-                # 如果连续两个点的时间差超过 2 分钟，说明发生了中途取消勾选造成的“断档”
-                if diff > 2:
-                    needs_refill = True
+                # ==========================================
+                # 💡【核心修复】：从“只看尾巴”改为“全局扫描”
+                # 遍历所有的点，只要发现任何两个相邻点之间存在 > 2 分钟的缝隙，
+                # 就说明中间有被掩埋的断层，立刻触发回填！
+                # ==========================================
+                for i in range(1, len(times)):
+                    diff = get_m_idx(times[i]) - get_m_idx(times[i-1])
+                    if diff > 2:
+                        needs_refill = True
+                        break
 
             if needs_refill:
                 attempts = self._backfilled_codes.get(c, 0)
-                if attempts < 5: # 依然保留 5 次熔断保护底线
+                if attempts < 15: # 💡增加到15次，防止电脑刚唤醒时网络卡顿消耗掉次数
                     missing_codes.append(c)
 
         if not missing_codes:
