@@ -233,10 +233,21 @@ class FloatLabel(QWidget):
             pass
 
     def _check_and_backfill_missing(self):
-        """智能巡检：全局 X 光断层扫描，绝不放过任何一个历史缝隙"""
+        """智能巡检：全局 X 光扫描 + 并发风暴熔断器"""
         if not hasattr(self, '_backfilled_codes') or not isinstance(self._backfilled_codes, dict):
             self._backfilled_codes = {} 
             self._active_threads = []
+
+        # ==========================================
+        # 💡【终极修复：加装“防并发派单锁”】
+        # 先清理已经死掉的旧线程
+        self._active_threads = [t for t in self._active_threads if t.isRunning()]
+        
+        # 如果发现后台已经有一个“快递员”在拼命拉数据了，主程序立刻闭嘴退下！
+        # 绝对不允许在网络卡顿时，重复派发新订单，防止遭遇东财封杀和次数被秒耗尽！
+        if len(self._active_threads) > 0:
+            return
+        # ==========================================
 
         missing_codes = []
         
@@ -252,7 +263,6 @@ class FloatLabel(QWidget):
                 return 0
 
         for c in self.checked_codes:
-            # 拿到这只股票目前在内存里的所有时间点
             hist_entry = getattr(self, 'trend_history', {}).get(c)
             p_dict = hist_entry.get('p_dict', {}) if hist_entry else {}
             times = sorted(p_dict.keys())
@@ -260,14 +270,9 @@ class FloatLabel(QWidget):
             needs_refill = False
             
             if len(times) <= 1:
-                # 情况A：刚加的自选股，必须补全
                 needs_refill = True
             else:
-                # ==========================================
-                # 💡【核心修复】：从“只看尾巴”改为“全局扫描”
-                # 遍历所有的点，只要发现任何两个相邻点之间存在 > 2 分钟的缝隙，
-                # 就说明中间有被掩埋的断层，立刻触发回填！
-                # ==========================================
+                # 全局扫描：揪出任何 > 2 分钟的隐蔽缝隙
                 for i in range(1, len(times)):
                     diff = get_m_idx(times[i]) - get_m_idx(times[i-1])
                     if diff > 2:
@@ -276,7 +281,7 @@ class FloatLabel(QWidget):
 
             if needs_refill:
                 attempts = self._backfilled_codes.get(c, 0)
-                if attempts < 15: # 💡增加到15次，防止电脑刚唤醒时网络卡顿消耗掉次数
+                if attempts < 15: 
                     missing_codes.append(c)
 
         if not missing_codes:
@@ -286,12 +291,39 @@ class FloatLabel(QWidget):
         for c in missing_codes:
             self._backfilled_codes[c] = self._backfilled_codes.get(c, 0) + 1
         
-        self._active_threads = [t for t in self._active_threads if t.isRunning()]
         new_thread = TrendBackfillThread(missing_codes)
         new_thread.data_fetched.connect(self._on_backfill_data)
         self._active_threads.append(new_thread)
         new_thread.start()
 
+    def _force_refresh_all(self):
+        """手动强制刷新：重置当前股票的内存与熔断器，强制触发全量同步"""
+        # 1. 拿到当前正在显示的股票（打勾的）
+        codes_to_refresh = getattr(self, 'checked_codes', [])
+        if not codes_to_refresh:
+            return
+
+        # 2. 摧毁它们的历史记忆和熔断记录
+        for c in codes_to_refresh:
+            # 删掉本地缓存的历史分时数据，人为制造“完全断层”
+            if hasattr(self, 'trend_history') and c in self.trend_history:
+                del self.trend_history[c]
+                
+            # 清零重试次数，满血恢复 15 次的东财派单额度
+            if hasattr(self, '_backfilled_codes') and isinstance(self._backfilled_codes, dict):
+                self._backfilled_codes[c] = 0
+
+        # 3. 立刻呼叫巡检员去干活！（如果当前没有网络拥堵，它会瞬间派发线程）
+        self._check_and_backfill_missing()
+        
+        # 4. 强制触发一次 UI 重绘（防止留下残影）
+        try:
+            self.table.viewport().update()
+        except Exception:
+            pass
+            
+        print("🔃 已触发手动强制全量刷新！")
+    
     def set_magnifier_dir(self, direction: str):
         self.magnifier_dir = direction
         self._notify_change()
@@ -937,6 +969,12 @@ class FloatLabel(QWidget):
     # ----- 交互 -----
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        
+        # ↓↓↓ 新增这部分：添加手动刷新选项 ↓↓↓
+        action_refresh = menu.addAction("手动刷新")
+        action_refresh.triggered.connect(self._force_refresh_all)
+        
+        menu.addSeparator() # 加一条分割线
         sub_cols = QMenu("显示指标", menu)
         for name in self.ALL_HEADERS:
             if name == "卖一":
