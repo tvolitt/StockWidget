@@ -510,7 +510,7 @@ class TrendMagnifierWindow(QWidget):
         prev_color = QColor(150, 150, 150, 180)
         avg_color = self.vwap_color
         line_color = self.fg
-        if current_price > prev_close: line_color = QColor("#dd2100") 
+        if current_price >= prev_close: line_color = QColor("#dd2100") 
         elif current_price < prev_close: line_color = QColor("#019933")
 
         # --- 核心绘画层 ---
