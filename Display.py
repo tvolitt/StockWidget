@@ -222,8 +222,9 @@ class TrendDelegate(QStyledItemDelegate):
 
         trend_data = data["trend"]
         # 兼容保护：提取时间戳
-        if len(trend_data) == 4:
-            prev_close, times, prices, avgs = trend_data
+        if len(trend_data) == 5:
+            # 把 vols（成交量）接过来，但在小图里不画它，保持极简
+            prev_close, times, prices, avgs, vols = trend_data
         else:
             return  # 如果数据还没刷新过来，直接跳过
 
@@ -367,25 +368,29 @@ class TrendBackfillThread(QThread):
                 
                 for item in trends:
                     parts = item.split(',')
-                    if len(parts) < 8:
-                        continue
+                    if len(parts) < 8: continue
                         
-                    # 时间解析 (保留 "09:30" 格式)
                     full_time = parts[0]
                     time_str = full_time.split(' ')[1]
                     
-                    # 🛡️ 降维打击：直接拿东财算好的均价，一分钱都不会差！
                     price = float(parts[2])  # 现价
-                    avg = float(parts[7])    # 绝对精确的 VWAP 均价
+                    avg = float(parts[7])    # 均价
+                    vol = float(parts[5])    # 💡新增：成交量(手)
                     
                     p_dict[time_str] = price
                     a_dict[time_str] = avg
+                    # 💡新增：把成交量存入字典
+                    if 'v_dict' not in locals(): v_dict = {}
+                    v_dict[time_str] = vol
                 
                 # 组装正确的数据结构传给前台
                 history_data = {
                     'date': true_date_str, 
                     'p_dict': p_dict,
-                    'a_dict': a_dict
+                    'a_dict': a_dict,
+                    'v_dict': v_dict,
+                    # 💡【核心修复 1】：必须为新浪接口预留出这个空字典，否则必定崩溃！
+                    'cum_v_dict': {} 
                 }
                 
                 self.data_fetched.emit(code, history_data)
@@ -405,7 +410,7 @@ class TrendMagnifierWindow(QWidget):
         # 设置为不受主窗口限制的提示级悬浮窗
         self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setFixedSize(280, 180)  # 放大版尺寸，可根据你的喜好调整
+        self.setFixedSize(300, 260)  # 放大版尺寸，可根据你的喜好调整
         
         self.trend_data = None
         self.fg = QColor("#FFFFFF")
@@ -424,189 +429,176 @@ class TrendMagnifierWindow(QWidget):
         # self.setWindowOpacity(opacity)  # 接收主窗口的整体透明度
         self.update()
 
+    def _calc_macd(self, prices):
+        """实时推算 MACD (参数 12, 26, 9)"""
+        if not prices: return [], [], []
+        ema12, ema26 = [prices[0]], [prices[0]]
+        
+        # 1. 算 EMA
+        for p in prices[1:]:
+            ema12.append(ema12[-1] * 11/13 + p * 2/13)
+            ema26.append(ema26[-1] * 25/27 + p * 2/27)
+            
+        # 2. 算 DIF
+        dif = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
+        
+        # 3. 算 DEA 和 MACD柱
+        dea = [dif[0]]
+        for d in dif[1:]:
+            dea.append(dea[-1] * 8/10 + d * 2/10)
+            
+        macd = [(d - de) * 2 for d, de in zip(dif, dea)]
+        return dif, dea, macd
+
     def paintEvent(self, event):
-        if not self.trend_data or len(self.trend_data) < 3:
+        if not hasattr(self, 'trend_data') or not self.trend_data:
             return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        
-        rect = self.rect()
-        
-        # 1. 背景与边框
-        painter.fillRect(rect, QColor(0, 0, 0))
-        border_color = QColor(self.fg.red(), self.fg.green(), self.fg.blue(), 80)
-        painter.setPen(QPen(border_color, 1))
-        painter.drawRect(0, 0, rect.width()-1, rect.height()-1)
-
-        # ==========================================
-        # 【核心修改 1】：加宽右侧专属文字区
-        # ==========================================
-        pad = 10
-        right_margin = 80  # 右侧专属文字区宽度
-        chart_rect = rect.adjusted(pad, pad, -right_margin, -pad)
-
-        # 2. 容错解析数据
-        if len(self.trend_data) == 4:
-            prev_close, times, prices, avgs = self.trend_data
+            
+        # 兼容老数据结构
+        if len(self.trend_data) == 5:
+            prev_close, times, prices, avgs, vols = self.trend_data
         else:
-            prev_close, prices, avgs = self.trend_data
-            times = []
+            prev_close, times, prices, avgs = self.trend_data
+            vols = [0] * len(prices)
 
-        if not prices:
-            return
+        from PySide6.QtGui import QPainter, QColor, QPen
+        from PySide6.QtCore import QPointF, QRect
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
 
-        # 动态小数精度 (普通股票2位，ETF3位)
-        dec = 3 if prev_close < 10 and abs(prev_close - round(prev_close, 2)) > 0.001 else 2
-
-        # ==========================================
-        # ↓↓↓ 核心修复 1：拆分真实极值与画图极值 ↓↓↓
-        # ==========================================
-        max_p = max(max(prices), max(avgs)) if avgs else max(prices)
-        min_p = min(min(prices), min(avgs)) if avgs else min(prices)
+        w, h = self.width(), self.height()
+        # 💡 再次拓宽到 105px，确保上下限的“价格+百分比”能完全显示
+        chart_w = w - 105
         
-        # 1. 真实的最大差值（用于计算右上角和右下角的精准百分比）
-        real_max_diff = max(abs(max_p - prev_close), abs(min_p - prev_close))
+        # 💡 三段式比例：主图 60%，成交量 20%，MACD 20%
+        main_h = int(h * 0.6)
+        vol_h = int(h * 0.2)
+        macd_h = h - main_h - vol_h
+
+        # 1. 锁定纯黑底色
+        painter.fillRect(0, 0, w, h, getattr(self, 'bg', QColor(0, 0, 0, 230)))
         
-        # 2. 画图用的差值：按照你的要求，乘上 1.1 的余量系数（防止曲线贴边）
-        margin_diff = real_max_diff * 1.2 if real_max_diff > 0 else prev_close * 0.01
+        if not prices: return
 
-        # 3. Y轴的上下限由带余量的 margin_diff 决定（撑开天花板和地板）
-        y_max = prev_close + margin_diff
-        y_min = prev_close - margin_diff
-        # ==========================================
+        # 2. 算坐标比例
+        max_p, min_p = max(prices), min(prices)
+        y_range = max(abs(max_p - prev_close), abs(min_p - prev_close))
+        y_range = y_range if y_range > 0 else prev_close * 0.01
+        
+        # 真实的上下限（用于右侧固定文字显示）
+        p_max, p_min = prev_close + y_range, prev_close - y_range
+        
+        # 💡 核心修改：图表绘制上下限额外扩展 2%（0.02 * 昨收）
+        # 这会把曲线向中间压缩一点，给顶部和底部的文字腾出“专属房间”
+        draw_range = y_range + (prev_close * 0.02)
+        draw_max = prev_close + draw_range
+        draw_min = prev_close - draw_range
+        
+        v_max = max(vols) if vols else 1
+        v_max = v_max if v_max > 0 else 1
+        
+        dif, dea, macd = self._calc_macd(prices)
+        m_max = max(abs(max(dif + dea + macd)), abs(min(dif + dea + macd))) if dif else 0.001
+        m_max = m_max if m_max != 0 else 0.001
 
-        def get_y(val):
-            ratio = (val - y_min) / (y_max - y_min) if y_max > y_min else 0.5
-            return chart_rect.bottom() - ratio * chart_rect.height()
+        x_step = chart_w / 240.0
+        
+        # 3. 画虚线网格 (零轴)
+        grid_pen = QPen(QColor(255, 255, 255, 40), 1)
+        grid_pen.setStyle(Qt.DashLine)
+        painter.setPen(grid_pen)
+        # 主图零轴
+        main_mid_y = main_h / 2
+        painter.drawLine(0, main_mid_y, chart_w, main_mid_y)
+        # MACD 零轴
+        macd_mid_y = main_h + vol_h + macd_h / 2
+        painter.drawLine(0, macd_mid_y, chart_w, macd_mid_y)
 
-        def get_x(idx):
-            if times and idx < len(times):
-                t_str = times[idx]
-                try:
-                    h, m = map(int, t_str.split(':'))
-                    if h < 9 or (h == 9 and m < 30): m_idx = 0
-                    elif h < 11 or (h == 11 and m <= 30): m_idx = (h - 9) * 60 + m - 30
-                    elif h >= 13: m_idx = 120 + (h - 13) * 60 + m
-                    else: m_idx = 120
-                except:
-                    m_idx = 0
+        # 4. 开始画线和柱子
+        pts_p, pts_a = [], []
+        for i, (p, a, v, d, de, m) in enumerate(zip(prices, avgs, vols, dif, dea, macd)):
+            x = i * x_step
+            
+            # 💡 核心修改：使用扩展后的 draw_max 和 draw_min 进行映射
+            y_p = main_h - (p - draw_min) / (draw_max - draw_min) * main_h
+            y_a = main_h - (a - draw_min) / (draw_max - draw_min) * main_h
+            pts_p.append(QPointF(x, y_p))
+            pts_a.append(QPointF(x, y_a))
+            
+            # 画成交量柱 (红绿配)
+            y_v = main_h + vol_h - (v / v_max) * vol_h
+            v_color = QColor(255, 50, 50, 200) if i == 0 or p >= prices[i-1] else QColor(50, 255, 50, 200)
+            painter.setPen(QPen(v_color, 1))
+            painter.fillRect(QRect(x, y_v, max(1, x_step-1), main_h + vol_h - y_v), v_color)
+            
+            # 画 MACD 柱 (红绿配)
+            y_m = macd_mid_y - (m / m_max) * (macd_h / 2)
+            m_color = QColor(255, 50, 50, 200) if m >= 0 else QColor(50, 255, 50, 200)
+            if m >= 0:
+                painter.fillRect(QRect(x, y_m, max(1, x_step-1), macd_mid_y - y_m), m_color)
             else:
-                m_idx = idx
+                painter.fillRect(QRect(x, macd_mid_y, max(1, x_step-1), y_m - macd_mid_y), m_color)
 
-            m_idx = max(0, min(240, m_idx))
-            return chart_rect.left() + (m_idx / 240.0) * chart_rect.width()
+        # 5. 连线 (价格白线，均价黄线)
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1.5))
+        painter.drawPolyline(pts_p)
+        painter.setPen(QPen(QColor(255, 255, 0, 180), 1.5))
+        painter.drawPolyline(pts_a)
 
-        # 3. 准备数据坐标
-        total_pts = len(prices)
-        current_price = prices[-1]
-        current_avg = avgs[-1] if avgs else current_price
-        
-        y_prev = get_y(prev_close)
-        y_curr = get_y(current_price)
-        y_avg = get_y(current_avg)
-
-        # 4. 颜色定义
-        prev_color = QColor(150, 150, 150, 180)
-        avg_color = self.vwap_color
-        line_color = self.fg
-        if current_price >= prev_close: line_color = QColor("#dd2100") 
-        elif current_price < prev_close: line_color = QColor("#019933")
-
-        # --- 核心绘画层 ---
-        # A. 画均价线 (黄)
-        if avgs and len(avgs) == total_pts:
-            path_avg = QPainterPath()
-            path_avg.moveTo(get_x(0), get_y(avgs[0]))
-            for i in range(1, total_pts):
-                path_avg.lineTo(get_x(i), get_y(avgs[i]))
-            painter.setPen(QPen(avg_color, 2)) 
-            painter.drawPath(path_avg)
-
-        # B. 画价格线 (白/红/绿)
-        path_price = QPainterPath()
-        path_price.moveTo(get_x(0), get_y(prices[0]))
-        for i in range(1, total_pts):
-            path_price.lineTo(get_x(i), get_y(prices[i]))
-        painter.setPen(QPen(line_color, 2)) 
-        painter.drawPath(path_price)
-
-        # 1. 绘制横贯全图的辅助线 (稍微向右延伸一点点，与文字框连接)
-        painter.setPen(QPen(prev_color, 1, Qt.DashLine))
-        painter.drawLine(chart_rect.left(), int(y_prev), chart_rect.right() + 4, int(y_prev))
-        
-        painter.setPen(QPen(line_color, 1, Qt.DotLine))
-        painter.drawLine(chart_rect.left(), int(y_curr), chart_rect.right() + 4, int(y_curr))
-        
-        painter.setPen(QPen(avg_color, 1, Qt.DotLine))
-        painter.drawLine(chart_rect.left(), int(y_avg), chart_rect.right() + 4, int(y_avg))
+        # 6. 连线 (DIF 白线，DEA 蓝线)
+        pts_dif = [QPointF(i * x_step, macd_mid_y - (d / m_max) * (macd_h / 2)) for i, d in enumerate(dif)]
+        pts_dea = [QPointF(i * x_step, macd_mid_y - (de / m_max) * (macd_h / 2)) for i, de in enumerate(dea)]
+        painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
+        painter.drawPolyline(pts_dif)
+        painter.setPen(QPen(QColor(50, 200, 255, 150), 1))
+        painter.drawPolyline(pts_dea)
 
         # ==========================================
-        # 【修改 2】：支持“主次双字号拼接”的高级画笔
+        # 7. 绘制右侧数值体系（带物理隔离与透明底，靠左对齐）
         # ==========================================
-        def draw_tag(y_pos, text_main, color, text_sub=""):
-            # 1. 测算主文本（大字）宽度
-            font_main = painter.font()
-            font_main.setPointSize(8) # 主字号 8
-            painter.setFont(font_main)
-            fm_main = painter.fontMetrics()
-            tw1 = fm_main.horizontalAdvance(text_main)
-            th = fm_main.height()
+        def draw_dynamic_tag(y_pos, text, color):
+            """专门给现价、均价用的游标：被限制在图表内部，绝不越界打扰上下限"""
+            y_pos = max(20, min(main_h - 20, y_pos))
             
-            # 2. 测算副文本（小字）宽度
-            tw2 = 0
-            if text_sub:
-                font_sub = painter.font()
-                font_sub.setPointSize(7) # 小字号 6（如果你觉得太小可以改成 7）
-                painter.setFont(font_sub)
-                fm_sub = painter.fontMetrics()
-                tw2 = fm_sub.horizontalAdvance(text_sub)
-                
-            # 3. 计算总宽度和背景框
-            tw = tw1 + tw2
-            bg_pad_x, bg_pad_y = 5, 2
-            tag_rect = QRect(chart_rect.right() + 4, 
-                             int(y_pos) - th // 2 - bg_pad_y, 
-                             tw + bg_pad_x * 2, th + bg_pad_y * 2)
-            
-            # 4. 画底色和边框
-            painter.fillRect(tag_rect, QColor(0, 0, 0, 0))
+            # 💡 chart_w + 5: 避免文字死死贴在线上，留 5px 呼吸空间
+            # 宽度 90 足够容纳下百元股的超长文本
+            rect = QRect(chart_w + 5, int(y_pos - 10), 90, 20)
             painter.setPen(color)
-            
-            # 5. 分段画文字 (完美居中对齐)
-            painter.setFont(font_main)
-            painter.drawText(tag_rect.left() + bg_pad_x, tag_rect.top(), tw1, tag_rect.height(), Qt.AlignLeft | Qt.AlignVCenter, text_main)
-            
-            if text_sub:
-                painter.setFont(font_sub)
-                painter.drawText(tag_rect.left() + bg_pad_x + tw1, tag_rect.top(), tw2, tag_rect.height(), Qt.AlignLeft | Qt.AlignVCenter, text_sub)
+            # 💡 改为靠左对齐 (Qt.AlignLeft)
+            painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, text)
 
-        # ------------------------------------------
-        # 1. 画图表上下边缘的“最大振幅百分比” 
-        # ------------------------------------------
-        if prev_close > 0:
-            real_max_pct = (real_max_diff / prev_close) * 100
-            draw_tag(chart_rect.top(), f"+{real_max_pct:.2f}%", QColor("#dd2100"))
-            draw_tag(chart_rect.bottom(), f"-{real_max_pct:.2f}%", QColor("#019933"))
-
-        # ------------------------------------------
-        # 2. 计算最新价涨跌幅并组装主副文本
-        # ------------------------------------------
-        current_pct = 0.0
-        if prev_close > 0:
-            current_pct = (current_price - prev_close) / prev_close * 100
-
-        str_prev = f"{prev_close:.{dec}f}"
-        str_avg = f"{current_avg:.{dec}f}"
+        # 7.1 画真实的上下限及零线 (价格 + 百分比)
+        pct_max = (p_max / prev_close - 1) * 100
+        pct_min = (p_min / prev_close - 1) * 100
+        zero_y = main_h / 2 
         
-        # 【修改 3】：拆分成主字符串和副字符串（括号部分）
-        str_curr_main = f"{current_price:.{dec}f}"
-        str_curr_sub = f"({current_pct:+.2f}%)"
+        # 💡 宽度给到 100，格式全部统一为： 价格(百分比)
+        painter.setPen(QColor(255, 50, 50))
+        painter.drawText(QRect(chart_w + 5, 0, 100, 20), Qt.AlignLeft | Qt.AlignVCenter, f"{p_max:.2f}({pct_max:+.2f}%)")
+        
+        painter.setPen(QColor(50, 255, 50))
+        painter.drawText(QRect(chart_w + 5, main_h - 20, 100, 20), Qt.AlignLeft | Qt.AlignVCenter, f"{p_min:.2f}({pct_min:+.2f}%)")
+        
+        painter.setPen(QColor(150, 150, 150))
+        painter.drawText(QRect(chart_w + 5, int(zero_y - 10), 100, 20), Qt.AlignLeft | Qt.AlignVCenter, f"{prev_close:.2f}(0.00%)")
 
-        # ------------------------------------------
-        # 3. 按顺序绘制右侧游标标签（最新价传入副字符串）
-        # ------------------------------------------
-        draw_tag(y_prev, str_prev, prev_color)
-        draw_tag(y_avg, str_avg, avg_color)
-        # 注意：只有最新价传了第四个参数 str_curr_sub
-        draw_tag(y_curr, str_curr_main, line_color, str_curr_sub)
+        # 7.2 画最新均价 (黄色，价格 + 百分比)
+        last_a = avgs[-1]
+        last_a_y = main_h - (last_a - draw_min) / (draw_max - draw_min) * main_h
+        
+        # 💡 新增：计算均价相对于昨收的涨跌幅
+        pct_a = (last_a / prev_close - 1) * 100 
+        
+        # 💡 格式化为与上下限完全一样的：价格(百分比)
+        draw_dynamic_tag(last_a_y, f"{last_a:.2f}({pct_a:+.2f}%)", QColor(255, 255, 0))
+
+        # 7.3 画最新现价 (价格+百分比)
+        last_p = prices[-1]
+        last_p_y = main_h - (last_p - draw_min) / (draw_max - draw_min) * main_h
+        pct_p = (last_p / prev_close - 1) * 100
+        
+        if pct_p > 0.01: tag_color = QColor(255, 50, 50)
+        elif pct_p < -0.01: tag_color = QColor(50, 255, 50)
+        else: tag_color = QColor(200, 200, 200)
+            
+        draw_dynamic_tag(last_p_y, f"{last_p:.2f}({pct_p:+.2f}%)", tag_color)

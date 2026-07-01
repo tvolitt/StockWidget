@@ -209,9 +209,12 @@ class FloatLabel(QWidget):
                 # 如果本地有 14:01 的最新点而东财只有 14:00，14:01 会安全保留！
                 merged_p.update(history_data.get('p_dict', {}))
                 merged_a.update(history_data.get('a_dict', {}))
+                merged_v = self.trend_history[code].get('v_dict', {}).copy()
+                merged_v.update(history_data.get('v_dict', {}))
                 
                 self.trend_history[code]['p_dict'] = merged_p
                 self.trend_history[code]['a_dict'] = merged_a
+                self.trend_history[code]['v_dict'] = merged_v
                 
             elif local_date > hist_date:
                 # 💡【核心防御拦截】：
@@ -297,33 +300,53 @@ class FloatLabel(QWidget):
         new_thread.start()
 
     def _force_refresh_all(self):
-        """手动强制刷新：重置当前股票的内存与熔断器，强制触发全量同步"""
-        # 1. 拿到当前正在显示的股票（打勾的）
+        """手动强制刷新：重置内存、安全隔离旧线程、强制触发全量同步"""
         codes_to_refresh = getattr(self, 'checked_codes', [])
         if not codes_to_refresh:
             return
 
-        # 2. 摧毁它们的历史记忆和熔断记录
+        # ==========================================
+        # 💡【核心修复：建立“线程孤儿院”，彻底解决 QThread 崩溃】
+        # ==========================================
+        if hasattr(self, '_active_threads'):
+            # 如果孤儿院不存在，建一个
+            if not hasattr(self, '_thread_graveyard'):
+                self._thread_graveyard = []
+            
+            for t in self._active_threads:
+                try:
+                    # 1. 剪断旧线程的通讯电缆，让它拉到的废旧数据无法污染我们的前台！
+                    t.data_fetched.disconnect()
+                except:
+                    pass
+            
+            # 2. 把旧线程转移进孤儿院，保留 Python 引用，防止 GC 强杀报错！
+            self._thread_graveyard.extend(self._active_threads)
+            self._active_threads = []  # 砸碎当前防并发锁
+            
+            # 3. 顺手清理一下孤儿院里真正已经自然死亡的废线程，释放内存
+            self._thread_graveyard = [t for t in self._thread_graveyard if t.isRunning()]
+        # ==========================================
+
+        # 摧毁历史记忆和熔断记录
         for c in codes_to_refresh:
-            # 删掉本地缓存的历史分时数据，人为制造“完全断层”
             if hasattr(self, 'trend_history') and c in self.trend_history:
                 del self.trend_history[c]
                 
-            # 清零重试次数，满血恢复 15 次的东财派单额度
             if hasattr(self, '_backfilled_codes') and isinstance(self._backfilled_codes, dict):
                 self._backfilled_codes[c] = 0
 
-        # 3. 立刻呼叫巡检员去干活！（如果当前没有网络拥堵，它会瞬间派发线程）
+        # 立刻呼叫巡检员重新干活！
         self._check_and_backfill_missing()
         
-        # 4. 强制触发一次 UI 重绘（防止留下残影）
+        # 强制触发一次 UI 刷新，清除旧图残影
         try:
             self.table.viewport().update()
         except Exception:
             pass
             
-        print("🔃 已触发手动强制全量刷新！")
-    
+        print("🔃 已触发强制全量刷新！旧线程已安全隔离。")
+        
     def set_magnifier_dir(self, direction: str):
         self.magnifier_dir = direction
         self._notify_change()
@@ -672,32 +695,46 @@ class FloatLabel(QWidget):
                 if current_price == high_price: arrow = "↑"
                 elif current_price == low_price: arrow = "↓"
 
-            # ------ 新增：分时数据本地打点逻辑 ------
+            # ------ 分时数据本地打点逻辑 ------
             minute_str = f"{update_time[0]:02d}:{update_time[1]:02d}"
-
-            # ==========================================
-            # ↓↓↓ 新增核心修复：集合竞价“时间压缩”，消除垂直毛刺 ↓↓↓
-            # ==========================================
-            if minute_str < "09:30":
-                minute_str = "09:30"
-            # ==========================================
+            if minute_str < "09:30": minute_str = "09:30"
             
-            if code not in self.trend_history:
-                self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
+            # 💡 清理了累赘的 cum_v_dict，还原最干净的结构
+            if code not in self.trend_history or self.trend_history[code].get('date') != update_date_str:
+                self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}, 'v_dict': {}}
             
-            if self.trend_history[code]['date'] != update_date_str:
-                self.trend_history[code] = {'date': update_date_str, 'p_dict': {}, 'a_dict': {}}
-            
-            # 这里因为 current_price 已经替补了撮合价，竞价曲线再也不会跌到 0 了！
             self.trend_history[code]['p_dict'][minute_str] = current_price
             self.trend_history[code]['a_dict'][minute_str] = avg
 
-            # 提取排序后的时间，确保时间的绝对先后顺序
             sorted_times = sorted(self.trend_history[code]['p_dict'].keys())
             prices_list = [self.trend_history[code]['p_dict'][t] for t in sorted_times]
             avgs_list = [self.trend_history[code]['a_dict'].get(t, prices_list[i]) for i, t in enumerate(sorted_times)]
             
-            trend_payload = {"trend": (prev_close, sorted_times, prices_list, avgs_list)}
+            # ==========================================
+            # 💡 全新降维算量引擎：彻底消灭 0 量死锁
+            # ==========================================
+            vols_list = []
+            if sorted_times:
+                latest_t = sorted_times[-1]
+                hist_sum = 0
+                
+                for t in sorted_times:
+                    if t != latest_t:
+                        # 1. 历史已经走完的分钟：直接拿定格的成交量，并计入历史总和
+                        v = self.trend_history[code]['v_dict'].get(t, 0)
+                        vols_list.append(v)
+                        hist_sum += v
+                    else:
+                        # 2. 正在跳动的最新分钟：用新浪的【全天总成交量】 - 【历史所有的和】
+                        current_total_vol = deals_vol / 100.0
+                        current_min_vol = max(0, current_total_vol - hist_sum)
+                        vols_list.append(current_min_vol)
+                        
+                        # 持续刷新这一分钟的缓存，绝不提前锁死！
+                        self.trend_history[code]['v_dict'][t] = current_min_vol
+            # ==========================================
+
+            trend_payload = {"trend": (prev_close, sorted_times, prices_list, avgs_list, vols_list)}
             # ----------------------------------------
 
             k_payload = {"k": (opening_price, current_price, high_price, low_price, prev_close)}
@@ -1131,7 +1168,19 @@ class FloatLabel(QWidget):
                 print(f"去除 Win11 阴影失败: {e}")
 
     def showEvent(self, event):
+        """
+        系统级底层事件重写：拦截窗口从隐藏到显示的动作
+        """
+        # 1. 先让 Qt 把窗口正常画出来
         super().showEvent(event)
+        
+        # 2. 💡【终极杀招】：延迟 1 秒后自动触发“全量强制刷新”
+        # 为什么要延迟 1 秒？因为电脑刚从休眠中唤醒时，网卡通常需要 0.5~1 秒的时间重新连接网络。
+        # 如果瞬间发请求必定报错，等 1 秒刚刚好！
+        if hasattr(self, '_force_refresh_all'):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1000, self._force_refresh_all)
+            print("👁️ 窗口已显示，1秒后自动触发大清洗重连...")
 
         # 👇 新增这一行，每次窗口显示时强杀边框 👇
         self._remove_win11_border()
